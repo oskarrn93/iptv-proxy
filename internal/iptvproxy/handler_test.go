@@ -26,13 +26,13 @@ func newTestHandler(t *testing.T, upstream string) *FeedHandler {
 		Username:    "alice",
 		Password:    "secret",
 		Timeout:     5 * time.Second,
-	}, testLogger())
+	}, testLogger(), true)
 	require.NoError(t, err)
 	return h
 }
 
 func TestNewFeedProxy_InvalidUpstreamURL(t *testing.T) {
-	_, err := NewFeedProxy(FeedConfig{Name: "f", UpstreamURL: "not a url", Username: "a", Password: "b"}, testLogger())
+	_, err := NewFeedProxy(FeedConfig{Name: "f", UpstreamURL: "not a url", Username: "a", Password: "b"}, testLogger(), true)
 	assert.Error(t, err)
 }
 
@@ -180,4 +180,41 @@ func TestHealthEndpoint(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "ok", rec.Body.String())
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	h := newTestHandler(t, "http://upstream.example.com/get.php")
+	mux := h.Mux()
+
+	// Generate an auth failure so a feed-labeled sample exists to assert on.
+	authReq := httptest.NewRequest(http.MethodGet, "/playlist.m3u8", nil)
+	mux.ServeHTTP(httptest.NewRecorder(), authReq)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	assert.Contains(t, body, `feed="test"`)
+	assert.Contains(t, body, "iptv_proxy_auth_failures_total")
+	assert.Contains(t, body, "iptv_proxy_http_requests_total")
+}
+
+func TestMetricsEndpoint_Disabled(t *testing.T) {
+	h, err := NewFeedProxy(FeedConfig{
+		Name:        "test",
+		ListenAddr:  ":0",
+		UpstreamURL: "http://upstream.example.com/get.php",
+		Username:    "alice",
+		Password:    "secret",
+		Timeout:     5 * time.Second,
+	}, testLogger(), false)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
 }

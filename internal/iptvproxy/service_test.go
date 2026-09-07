@@ -20,7 +20,7 @@ func newTestService(t *testing.T, upstream string) *feedService {
 		Password:    "secret",
 		Timeout:     5 * time.Second,
 	}
-	s, err := newFeedService(cfg, newUpstreamRepository(testLogger()), testLogger())
+	s, err := newFeedService(cfg, newUpstreamRepository(testLogger()), testLogger(), newFeedMetrics("test", true, testLogger()))
 	require.NoError(t, err)
 	return s
 }
@@ -34,7 +34,7 @@ func TestNewFeedService_InvalidUpstreamURL(t *testing.T) {
 	}
 	for _, u := range tests {
 		t.Run(u, func(t *testing.T) {
-			_, err := newFeedService(FeedConfig{Name: "f", UpstreamURL: u, Username: "a", Password: "b"}, newUpstreamRepository(testLogger()), testLogger())
+			_, err := newFeedService(FeedConfig{Name: "f", UpstreamURL: u, Username: "a", Password: "b"}, newUpstreamRepository(testLogger()), testLogger(), newFeedMetrics(u, true, testLogger()))
 			assert.Error(t, err)
 		})
 	}

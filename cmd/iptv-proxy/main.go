@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -44,6 +45,19 @@ func run() int {
 		return 1
 	}
 
+	// A bad or missing value defaults to enabled and just logs, rather than
+	// exiting: metrics are diagnostic, not load-bearing, and shouldn't be able
+	// to keep the proxy from starting.
+	metricsEnabled := true
+	if raw, ok := os.LookupEnv("METRICS_ENABLED"); ok {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			logger.Error("invalid METRICS_ENABLED value, defaulting to enabled", "value", raw, "error", err)
+		} else {
+			metricsEnabled = parsed
+		}
+	}
+
 	servers := make([]*http.Server, 0, len(cfg.Feeds))
 	// A feed that cannot bind (port already taken, malformed listen_addr) must
 	// bring the process down: leaving it up would keep the container "healthy"
@@ -52,7 +66,7 @@ func run() int {
 	var wg sync.WaitGroup
 
 	for _, feedCfg := range cfg.Feeds {
-		proxy, err := iptvproxy.NewFeedProxy(feedCfg, logger)
+		proxy, err := iptvproxy.NewFeedProxy(feedCfg, logger, metricsEnabled)
 		if err != nil {
 			logger.Error("feed setup failed", "feed", feedCfg.Name, "error", err)
 			return 1

@@ -29,12 +29,13 @@ type feedService struct {
 	// creds is this feed's own username/password pre-encoded as a query
 	// fragment. It is stamped onto every rewritten playlist line, so it is
 	// built once per feed rather than once per line.
-	creds  string
-	repo   *upstreamRepository
-	logger *slog.Logger
+	creds   string
+	repo    *upstreamRepository
+	logger  *slog.Logger
+	metrics *feedMetrics
 }
 
-func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logger) (*feedService, error) {
+func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logger, metrics *feedMetrics) (*feedService, error) {
 	target, err := url.Parse(cfg.UpstreamURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid upstream_url: %w", err)
@@ -51,8 +52,9 @@ func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logge
 		timeout: cfg.Timeout,
 		creds: fmt.Sprintf("username=%s&password=%s",
 			url.QueryEscape(cfg.Username), url.QueryEscape(cfg.Password)),
-		repo:   repo,
-		logger: logger,
+		repo:    repo,
+		logger:  logger,
+		metrics: metrics,
 	}, nil
 }
 
@@ -197,6 +199,7 @@ func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHe
 		// err wraps the full upstream URL, Xtream credentials included, so it
 		// is logged (redacted) rather than returned to the client.
 		logger.ErrorContext(reqCtx, "upstream fetch failed", "error", redactErr(err))
+		s.metrics.recordUpstreamError(errorKindFetchFailed)
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 		return
 	}
@@ -207,6 +210,7 @@ func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHe
 	// error page as a valid, empty playlist.
 	if resp.StatusCode >= 400 {
 		logger.WarnContext(reqCtx, "upstream returned error status", "status", resp.StatusCode, "target", redact(target.String()))
+		s.metrics.recordUpstreamError(errorKindHTTPError)
 		http.Error(w, fmt.Sprintf("upstream returned %d", resp.StatusCode), resp.StatusCode)
 		return
 	}
@@ -311,6 +315,7 @@ func (s *feedService) streamWithReconnect(ctx context.Context, w http.ResponseWr
 
 		currentBody.Close()
 		currentBody = nil
+		s.metrics.streamReconnects.Inc()
 		wait = sleepWithBackoff(wait)
 		if ctx.Err() != nil {
 			return ctx.Err()

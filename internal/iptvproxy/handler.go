@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"log/slog"
 	"net/http"
+	"time"
 )
 
 // FeedHandler is one feed's HTTP entry point: it authenticates requests,
@@ -15,12 +16,14 @@ type FeedHandler struct {
 	password string
 	svc      *feedService
 	logger   *slog.Logger
+	metrics  *feedMetrics
 }
 
-func NewFeedProxy(cfg FeedConfig, logger *slog.Logger) (*FeedHandler, error) {
+func NewFeedProxy(cfg FeedConfig, logger *slog.Logger, metricsEnabled bool) (*FeedHandler, error) {
 	logger = logger.With("feed", cfg.Name)
+	metrics := newFeedMetrics(cfg.Name, metricsEnabled, logger)
 	repo := newUpstreamRepository(logger)
-	svc, err := newFeedService(cfg, repo, logger)
+	svc, err := newFeedService(cfg, repo, logger, metrics)
 	if err != nil {
 		return nil, err
 	}
@@ -29,20 +32,48 @@ func NewFeedProxy(cfg FeedConfig, logger *slog.Logger) (*FeedHandler, error) {
 		password: cfg.Password,
 		svc:      svc,
 		logger:   logger,
+		metrics:  metrics,
 	}, nil
 }
 
 func (h *FeedHandler) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/playlist.m3u8", h.withRequestLogger(h.handlePlaylist))
-	mux.HandleFunc("/", h.withRequestLogger(h.handlePlaylist))
-	mux.HandleFunc("/stream", h.withRequestLogger(h.handleStream))
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/playlist.m3u8", h.instrument(routePlaylist, h.withRequestLogger(h.handlePlaylist)))
+	mux.HandleFunc("/", h.instrument(routePlaylist, h.withRequestLogger(h.handlePlaylist)))
+	mux.HandleFunc("/stream", h.instrument(routeStream, h.withRequestLogger(h.handleStream)))
+	mux.HandleFunc("/health", h.instrument(routeHealth, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, max-age=0")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
-	})
+	}))
+	mux.Handle("/metrics", h.metrics.handler())
 	return mux
+}
+
+// statusRecorder captures the status code written by a handler so instrument
+// can label its metrics with it; a plain http.ResponseWriter doesn't expose
+// what was already written.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+// instrument wraps next with request count and duration metrics under the
+// given route label. route is a fixed label passed by the caller rather than
+// derived from the request path, keeping cardinality bounded to the handful
+// of routes this feed actually serves.
+func (h *FeedHandler) instrument(r route, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next(rec, req)
+		h.metrics.observeRequest(r, rec.status, time.Since(start))
+	}
 }
 
 // withRequestLogger stamps every request with its own request_id and attaches
@@ -73,6 +104,7 @@ func (h *FeedHandler) requireAuth(w http.ResponseWriter, r *http.Request) bool {
 	}
 	loggerFromContext(r.Context(), h.logger).WarnContext(r.Context(), "auth failed",
 		"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+	h.metrics.authFailures.Inc()
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
 	return false
 }
