@@ -20,15 +20,14 @@ func writeConfig(t *testing.T, contents string) string {
 
 func TestLoadConfig_Valid(t *testing.T) {
 	path := writeConfig(t, `
+listen_addr: ":58033"
 feeds:
   - name: feed1
-    listen_addr: ":8081"
     upstream_url: "http://example.com/get.php"
     username: user1
     password: pass1
     timeout: 30s
   - name: feed2
-    listen_addr: ":8082"
     upstream_url: "http://example.com/get2.php"
     username: user2
     password: pass2
@@ -36,6 +35,7 @@ feeds:
 
 	cfg, err := LoadConfig(path)
 	require.NoError(t, err)
+	assert.Equal(t, ":58033", cfg.ListenAddr)
 	require.Len(t, cfg.Feeds, 2)
 
 	assert.Equal(t, "feed1", cfg.Feeds[0].Name)
@@ -58,9 +58,22 @@ func TestLoadConfig_InvalidYAML(t *testing.T) {
 }
 
 func TestLoadConfig_NoFeeds(t *testing.T) {
-	path := writeConfig(t, "feeds: []")
+	path := writeConfig(t, "listen_addr: \":58033\"\nfeeds: []")
 	_, err := LoadConfig(path)
 	assert.ErrorContains(t, err, "no feeds")
+}
+
+func TestLoadConfig_MissingListenAddr(t *testing.T) {
+	path := writeConfig(t, `
+feeds:
+  - name: feed1
+    upstream_url: "http://example.com"
+    username: u
+    password: p
+`)
+	_, err := LoadConfig(path)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "config has no feeds")
 }
 
 func TestLoadConfig_MissingRequiredFields(t *testing.T) {
@@ -72,31 +85,20 @@ func TestLoadConfig_MissingRequiredFields(t *testing.T) {
 		{
 			name: "missing name",
 			yaml: `
+listen_addr: ":58033"
 feeds:
-  - listen_addr: ":8081"
-    upstream_url: "http://example.com"
+  - upstream_url: "http://example.com"
     username: u
     password: p
 `,
 			wantErr: "name is required",
 		},
 		{
-			name: "missing listen_addr",
-			yaml: `
-feeds:
-  - name: feed1
-    upstream_url: "http://example.com"
-    username: u
-    password: p
-`,
-			wantErr: "listen_addr is required",
-		},
-		{
 			name: "missing upstream_url",
 			yaml: `
+listen_addr: ":58033"
 feeds:
   - name: feed1
-    listen_addr: ":8081"
     username: u
     password: p
 `,
@@ -105,9 +107,9 @@ feeds:
 		{
 			name: "missing username",
 			yaml: `
+listen_addr: ":58033"
 feeds:
   - name: feed1
-    listen_addr: ":8081"
     upstream_url: "http://example.com"
     password: p
 `,
@@ -116,9 +118,9 @@ feeds:
 		{
 			name: "missing password",
 			yaml: `
+listen_addr: ":58033"
 feeds:
   - name: feed1
-    listen_addr: ":8081"
     upstream_url: "http://example.com"
     username: u
 `,
@@ -136,21 +138,20 @@ feeds:
 	}
 }
 
-func TestLoadConfig_DuplicateListenAddr(t *testing.T) {
+func TestLoadConfig_DuplicateUsername(t *testing.T) {
 	path := writeConfig(t, `
+listen_addr: ":58033"
 feeds:
   - name: feed1
-    listen_addr: ":8081"
     upstream_url: "http://example.com"
-    username: u1
+    username: dupuser
     password: p1
   - name: feed2
-    listen_addr: ":8081"
     upstream_url: "http://example.com"
-    username: u2
+    username: dupuser
     password: p2
 `)
 	_, err := LoadConfig(path)
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "duplicate listen_addr")
+	assert.ErrorContains(t, err, "duplicate username")
 }

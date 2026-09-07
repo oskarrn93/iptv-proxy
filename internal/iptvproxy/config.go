@@ -12,20 +12,17 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config is the top-level config.yaml shape: one entry per M3U8 feed,
-// each served on its own listen address/port within this one process.
+// Config is the top-level config.yaml shape: one entry per M3U8 feed, all
+// served from a single shared listen address. A request's own
+// username/password (not this process's listen port) is what picks which
+// feed's upstream serves it — see Proxy.authenticate.
 type Config struct {
-	Feeds []FeedConfig `yaml:"feeds" validate:"min=1,unique=ListenAddr,dive"`
-	// HealthAddr, when set, serves a single aggregated /health endpoint that
-	// probes every feed's own /health route, so operators (and the container
-	// healthcheck) can poll one port instead of one per feed. Optional: with
-	// no value set, only each feed's own /health is served.
-	HealthAddr string `yaml:"health_addr"`
+	ListenAddr string       `yaml:"listen_addr" validate:"required"`
+	Feeds      []FeedConfig `yaml:"feeds" validate:"min=1,unique=Username,dive"`
 }
 
 type FeedConfig struct {
 	Name        string        `yaml:"name" validate:"required"`
-	ListenAddr  string        `yaml:"listen_addr" validate:"required"`
 	UpstreamURL string        `yaml:"upstream_url" validate:"required,http_url"`
 	Username    string        `yaml:"username" validate:"required"`
 	Password    string        `yaml:"password" validate:"required"`
@@ -52,7 +49,6 @@ var validate = validator.New(validator.WithRequiredStructEnabled())
 // validation errors read in terms of the file the operator actually edited.
 var feedYAMLKey = map[string]string{
 	"Name":          "name",
-	"ListenAddr":    "listen_addr",
 	"UpstreamURL":   "upstream_url",
 	"Username":      "username",
 	"Password":      "password",

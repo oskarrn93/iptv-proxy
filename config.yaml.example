@@ -1,15 +1,12 @@
 # Copy to config.yaml (gitignored) and fill in real values.
-# One entry per M3U8 feed; each gets its own listen port within this
-# single process/container. Point IPTV apps at:
+# All feeds share this one listen address/port; a request's own
+# username/password (query params or HTTP Basic Auth) picks which feed's
+# upstream serves it. Point IPTV apps at:
 #   http://<host>:<listen_port>/playlist.m3u8?username=<username>&password=<password>
-
-# Optional: serves one aggregated /health that probes every feed's own
-# /health, so a single port can be polled instead of one per feed. Omit to
-# skip it and rely on each feed's own /health only.
-health_addr: ":58033"
+listen_addr: ":58033"
 
 # public_base_url should be set to the address IPTV apps actually reach this
-# feed at (its listen_addr's public host:port). Rewritten /stream links are
+# proxy at (listen_addr's public host:port). Rewritten /stream links are
 # otherwise served as paths relative to that address, which most players
 # reject the whole playlist over since a plain M3U channel list (unlike an
 # HLS sub-playlist) has no base URI to resolve a relative entry against.
@@ -17,18 +14,19 @@ health_addr: ":58033"
 # these (case-insensitive) — e.g. an Xtream m3u_plus feed's "Movies: <genre>"
 # and "Series: <show>" VOD categories, keeping only live channels. Omit to
 # keep everything.
+#
+# Each feed's username must be unique across the whole file — it's the only
+# thing that tells two feeds apart on the shared port.
 feeds:
   - name: feed-1
-    listen_addr: ":58034"
-    public_base_url: "http://your-host.example.com:58034"
+    public_base_url: "http://your-host.example.com:58033"
     exclude_group_prefixes: ["movies:", "series:"]
     upstream_url: "http://provider.example.com:8080/get.php?username=UPSTREAM_USER&password=UPSTREAM_PASS&type=m3u_plus&output=ts"
     username: proxyuser1
     password: proxypass1
 
   - name: feed-2
-    listen_addr: ":58035"
-    public_base_url: "http://your-host.example.com:58035"
+    public_base_url: "http://your-host.example.com:58033"
     exclude_group_prefixes: ["movies:", "series:"]
     upstream_url: "http://provider.example.com:8080/get.php?username=UPSTREAM_USER&password=UPSTREAM_PASS&type=m3u_plus&output=ts"
     username: proxyuser2

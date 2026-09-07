@@ -1,7 +1,9 @@
 package main
 
 // iptv-proxy: hosts multiple M3U8 IPTV feeds behind unguessable-credential
-// proxies, one listen port per feed, all from a single process/container.
+// proxies, all sharing one listen address/port. A request's own
+// username/password (not which port it hit) picks which feed's upstream
+// serves it.
 //
 // Each feed rewrites every playlist/segment URL in the upstream M3U8 so the
 // real upstream (and any Xtream credentials embedded in it) never reaches
@@ -16,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -58,63 +59,32 @@ func run() int {
 		}
 	}
 
-	servers := make([]*http.Server, 0, len(cfg.Feeds))
-	// A feed that cannot bind (port already taken, malformed listen_addr) must
-	// bring the process down: leaving it up would keep the container "healthy"
-	// while that feed serves nothing.
-	serveErrs := make(chan error, len(cfg.Feeds))
+	proxy, err := iptvproxy.NewProxy(cfg, logger, metricsEnabled)
+	if err != nil {
+		logger.Error("proxy setup failed", "error", err)
+		return 1
+	}
+
+	srv := &http.Server{
+		Addr:        cfg.ListenAddr,
+		Handler:     proxy.Mux(),
+		ReadTimeout: 10 * time.Second,
+		// No WriteTimeout: a live TS relay writes for as long as the viewer
+		// watches, and any deadline here would cut it off mid-stream.
+		WriteTimeout: 0,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	serveErrs := make(chan error, 1)
 	var wg sync.WaitGroup
-
-	for _, feedCfg := range cfg.Feeds {
-		proxy, err := iptvproxy.NewFeedProxy(feedCfg, logger, metricsEnabled)
-		if err != nil {
-			logger.Error("feed setup failed", "feed", feedCfg.Name, "error", err)
-			return 1
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		logger.Info("listening", "addr", srv.Addr, "feeds", len(cfg.Feeds))
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErrs <- err
 		}
-
-		srv := &http.Server{
-			Addr:        feedCfg.ListenAddr,
-			Handler:     proxy.Mux(),
-			ReadTimeout: 10 * time.Second,
-			// No WriteTimeout: a live TS relay writes for as long as the viewer
-			// watches, and any deadline here would cut it off mid-stream.
-			WriteTimeout: 0,
-			IdleTimeout:  120 * time.Second,
-		}
-		servers = append(servers, srv)
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			logger.Info("listening", "feed", feedCfg.Name, "addr", srv.Addr)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				serveErrs <- fmt.Errorf("feed %q: %w", feedCfg.Name, err)
-			}
-		}()
-	}
-
-	if cfg.HealthAddr != "" {
-		aggregator, err := iptvproxy.NewHealthAggregator(cfg.Feeds)
-		if err != nil {
-			logger.Error("health aggregator setup failed", "error", err)
-			return 1
-		}
-		srv := &http.Server{
-			Addr:        cfg.HealthAddr,
-			Handler:     aggregator,
-			ReadTimeout: 10 * time.Second,
-		}
-		servers = append(servers, srv)
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			logger.Info("listening", "feed", "health", "addr", srv.Addr)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				serveErrs <- fmt.Errorf("health aggregator: %w", err)
-			}
-		}()
-	}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -130,10 +100,8 @@ func run() int {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	for _, srv := range servers {
-		if err := srv.Shutdown(ctx); err != nil {
-			logger.Error("shutdown error", "error", err)
-		}
+	if err := srv.Shutdown(ctx); err != nil {
+		logger.Error("shutdown error", "error", err)
 	}
 
 	wg.Wait()

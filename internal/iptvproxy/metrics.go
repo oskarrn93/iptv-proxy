@@ -2,12 +2,10 @@ package iptvproxy
 
 import (
 	"log/slog"
-	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // route identifies which handler served a request, used as the "route" label
@@ -19,7 +17,6 @@ type route string
 const (
 	routePlaylist route = "playlist"
 	routeStream   route = "stream"
-	routeHealth   route = "health"
 )
 
 // errorKind identifies why an upstream request failed, used as the "kind"
@@ -41,16 +38,19 @@ const (
 )
 
 // feedMetrics holds one feed's Prometheus collectors on their own registry
-// rather than the global default: every feed runs in the same process on its
-// own port, and a shared registry would either collide on registration or
-// force every feed's samples onto every feed's /metrics endpoint.
+// rather than the global default or one registry shared across feeds:
+// registering the same metric names into one registry per feed, then merging
+// those registries at scrape time (see Proxy.metricsHandler), keeps a
+// registration failure in one feed from taking every feed's /metrics samples
+// down with it.
 //
 // The collectors are always created and always safe to record into, whether
 // or not metrics are enabled or registration succeeded — callers never need
 // to nil-check before calling Inc()/Observe(). Only exposure via /metrics is
 // conditional: a disabled feed or a registration failure (logged, not
-// panicked) serves a 404 from handler() instead of ever taking the process
-// down, since a metrics problem should never affect stream serving.
+// panicked) leaves registry nil, so Proxy.metricsHandler just skips this
+// feed's samples instead of the process ever going down over it, since a
+// metrics problem should never affect stream serving.
 type feedMetrics struct {
 	registry         *prometheus.Registry
 	requestsTotal    *prometheus.CounterVec
@@ -118,15 +118,4 @@ func (m *feedMetrics) observeRequest(r route, status int, duration time.Duration
 // recordUpstreamError increments upstreamErrors for the given kind.
 func (m *feedMetrics) recordUpstreamError(kind errorKind) {
 	m.upstreamErrors.WithLabelValues(string(kind)).Inc()
-}
-
-// handler serves /metrics, or a 404 when metrics are disabled or failed to
-// register — never an error that would need the caller to fall back.
-func (m *feedMetrics) handler() http.Handler {
-	if m.registry == nil {
-		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			http.Error(w, "metrics disabled", http.StatusNotFound)
-		})
-	}
-	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
 }

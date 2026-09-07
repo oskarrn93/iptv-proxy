@@ -3,50 +3,85 @@ package iptvproxy
 import (
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// FeedHandler is one feed's HTTP entry point: it authenticates requests,
-// parses and validates request parameters, and translates the service
-// layer's results into HTTP responses. It holds no business logic of its
-// own beyond that request/response translation.
-type FeedHandler struct {
+// feed is one configured feed's runtime pieces: the credentials a client
+// authenticates with, and the service that knows how to serve it.
+type feed struct {
+	name     string
 	username string
 	password string
 	svc      *feedService
-	logger   *slog.Logger
 	metrics  *feedMetrics
 }
 
-func NewFeedProxy(cfg FeedConfig, logger *slog.Logger, metricsEnabled bool) (*FeedHandler, error) {
-	logger = logger.With("feed", cfg.Name)
-	metrics := newFeedMetrics(cfg.Name, metricsEnabled, logger)
-	repo := newUpstreamRepository(logger, cfg.Timeout)
-	svc, err := newFeedService(cfg, repo, logger, metrics)
-	if err != nil {
-		return nil, err
-	}
-	return &FeedHandler{
-		username: cfg.Username,
-		password: cfg.Password,
-		svc:      svc,
-		logger:   logger,
-		metrics:  metrics,
-	}, nil
+// Proxy is the single HTTP entry point for every configured feed. All feeds
+// share one listen address; a request's username/password (query params or
+// HTTP Basic Auth) is matched against every feed's own credentials to pick
+// which one's upstream serves it, so exposing several upstream IPTV accounts
+// no longer means exposing one port each.
+type Proxy struct {
+	feeds          []*feed
+	logger         *slog.Logger
+	metricsHandler http.Handler
 }
 
-func (h *FeedHandler) Mux() *http.ServeMux {
+func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, error) {
+	p := &Proxy{logger: logger}
+
+	// Gatherers merges every feed's own registry into one /metrics response
+	// without the feeds sharing a registry outright — each newFeedMetrics
+	// call still owns registration failures for just its own feed.
+	var gatherers prometheus.Gatherers
+	for _, feedCfg := range cfg.Feeds {
+		feedLogger := logger.With("feed", feedCfg.Name)
+		metrics := newFeedMetrics(feedCfg.Name, metricsEnabled, feedLogger)
+		if metrics.registry != nil {
+			gatherers = append(gatherers, metrics.registry)
+		}
+		repo := newUpstreamRepository(feedLogger, feedCfg.Timeout)
+		svc, err := newFeedService(feedCfg, repo, feedLogger, metrics)
+		if err != nil {
+			return nil, fmt.Errorf("feed %q: %w", feedCfg.Name, err)
+		}
+		p.feeds = append(p.feeds, &feed{
+			name:     feedCfg.Name,
+			username: feedCfg.Username,
+			password: feedCfg.Password,
+			svc:      svc,
+			metrics:  metrics,
+		})
+	}
+
+	if len(gatherers) == 0 {
+		p.metricsHandler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "metrics disabled", http.StatusNotFound)
+		})
+	} else {
+		p.metricsHandler = promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})
+	}
+
+	return p, nil
+}
+
+func (p *Proxy) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/playlist.m3u8", h.instrument(routePlaylist, h.withRequestLogger(h.handlePlaylist)))
-	mux.HandleFunc("/", h.instrument(routePlaylist, h.withRequestLogger(h.handlePlaylist)))
-	mux.HandleFunc("/stream", h.instrument(routeStream, h.withRequestLogger(h.handleStream)))
-	mux.HandleFunc("/health", h.instrument(routeHealth, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/playlist.m3u8", p.withRequestLogger(p.handlePlaylist))
+	mux.HandleFunc("/", p.withRequestLogger(p.handlePlaylist))
+	mux.HandleFunc("/stream", p.withRequestLogger(p.handleStream))
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, max-age=0")
-		writeHealthStatus(w, h.health())
-	}))
-	mux.Handle("/metrics", h.metrics.handler())
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.Handle("/metrics", p.metricsHandler)
 	return mux
 }
 
@@ -63,33 +98,35 @@ func (r *statusRecorder) WriteHeader(status int) {
 	r.ResponseWriter.WriteHeader(status)
 }
 
-// instrument wraps next with request count and duration metrics under the
-// given route label. route is a fixed label passed by the caller rather than
-// derived from the request path, keeping cardinality bounded to the handful
-// of routes this feed actually serves.
-func (h *FeedHandler) instrument(r route, next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, req *http.Request) {
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		start := time.Now()
-		next(rec, req)
-		h.metrics.observeRequest(r, rec.status, time.Since(start))
-	}
+// instrument runs next, then records the outcome against the matched feed's
+// own metrics under the given route label. Which feed that is isn't known
+// until authentication resolves it, so — unlike the old per-feed handler —
+// this is called per request rather than wrapped once at Mux() build time.
+func (f *feed) instrument(r route, w http.ResponseWriter, req *http.Request, next func(w http.ResponseWriter, req *http.Request)) {
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	start := time.Now()
+	next(rec, req)
+	f.metrics.observeRequest(r, rec.status, time.Since(start))
 }
 
 // withRequestLogger stamps every request with its own request_id and attaches
 // a logger carrying it to the request context, so every log line produced
 // while handling this request — in this handler, the service, and the
 // repository — can be grouped together by grepping on request_id.
-func (h *FeedHandler) withRequestLogger(next http.HandlerFunc) http.HandlerFunc {
+func (p *Proxy) withRequestLogger(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		reqLogger := h.logger.With("request_id", newRequestID())
+		reqLogger := p.logger.With("request_id", newRequestID())
 		next(w, r.WithContext(withLogger(r.Context(), reqLogger)))
 	}
 }
 
-// requireAuth accepts either ?username=&password= query params or HTTP Basic
-// Auth so both "M3U URL" and "Xtream login" style IPTV apps work.
-func (h *FeedHandler) requireAuth(w http.ResponseWriter, r *http.Request) bool {
+// authenticate accepts either ?username=&password= query params or HTTP
+// Basic Auth (so both "M3U URL" and "Xtream login" style IPTV apps work),
+// and matches them against every configured feed to pick which one serves
+// this request. A username that matches a known feed but the wrong password
+// counts an auth failure against that feed's own metrics; a username
+// matching no feed at all is logged but not attributed to any feed.
+func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) *feed {
 	user := r.URL.Query().Get("username")
 	pass := r.URL.Query().Get("password")
 	if user == "" && pass == "" {
@@ -97,55 +134,64 @@ func (h *FeedHandler) requireAuth(w http.ResponseWriter, r *http.Request) bool {
 			user, pass = basicUser, basicPass
 		}
 	}
-	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(h.username)) == 1
-	passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(h.password)) == 1
-	if userOK && passOK {
-		return true
+
+	var candidate *feed
+	for _, f := range p.feeds {
+		if subtle.ConstantTimeCompare([]byte(user), []byte(f.username)) != 1 {
+			continue
+		}
+		candidate = f
+		if subtle.ConstantTimeCompare([]byte(pass), []byte(f.password)) == 1 {
+			return f
+		}
 	}
-	loggerFromContext(r.Context(), h.logger).WarnContext(r.Context(), "auth failed",
+
+	loggerFromContext(r.Context(), p.logger).WarnContext(r.Context(), "auth failed",
 		"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
-	h.metrics.authFailures.Inc()
+	if candidate != nil {
+		candidate.metrics.authFailures.Inc()
+	}
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
-	return false
+	return nil
 }
 
-// health reports this feed's own liveness, independent of how it gets
-// rendered to an HTTP response.
-func (h *FeedHandler) health() HealthStatus {
-	return HealthStatus{Healthy: true}
-}
-
-// handlePlaylist serves the feed's own top-level playlist (the configured
-// upstream_url). Clients point their IPTV app at this URL instead of the
-// real upstream.
-func (h *FeedHandler) handlePlaylist(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAuth(w, r) {
+// handlePlaylist serves the matched feed's own top-level playlist (its
+// configured upstream_url). Clients point their IPTV app at this proxy
+// instead of the real upstream, with credentials picking which feed.
+func (p *Proxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
+	f := p.authenticate(w, r)
+	if f == nil {
 		return
 	}
-	loggerFromContext(r.Context(), h.logger).InfoContext(r.Context(), "playlist request",
-		"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
-
-	h.svc.servePlaylist(r.Context(), w, r.Header)
+	f.instrument(routePlaylist, w, r, func(w http.ResponseWriter, r *http.Request) {
+		loggerFromContext(r.Context(), f.svc.logger).InfoContext(r.Context(), "playlist request",
+			"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+		f.svc.servePlaylist(r.Context(), w, r.Header)
+	})
 }
 
 // handleStream serves rewritten segment/sub-playlist links produced by
-// rewritePlaylist, fetching whatever upstream URL is given in "u".
-func (h *FeedHandler) handleStream(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAuth(w, r) {
+// rewritePlaylist, fetching whatever upstream URL is given in "u" through the
+// matched feed.
+func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request) {
+	f := p.authenticate(w, r)
+	if f == nil {
 		return
 	}
-	streamReq, err := h.svc.parseStreamRequest(r.Context(), r.URL.Query().Get("u"))
-	if err != nil {
-		var reqErr *StreamRequestError
-		if errors.As(err, &reqErr) && reqErr.Forbidden {
-			loggerFromContext(r.Context(), h.logger).WarnContext(r.Context(), "rejected stream target",
-				"remote_addr", r.RemoteAddr, "error", err)
-			http.Error(w, "forbidden target", http.StatusForbidden)
+	f.instrument(routeStream, w, r, func(w http.ResponseWriter, r *http.Request) {
+		streamReq, err := f.svc.parseStreamRequest(r.Context(), r.URL.Query().Get("u"))
+		if err != nil {
+			var reqErr *StreamRequestError
+			if errors.As(err, &reqErr) && reqErr.Forbidden {
+				loggerFromContext(r.Context(), f.svc.logger).WarnContext(r.Context(), "rejected stream target",
+					"remote_addr", r.RemoteAddr, "error", err)
+				http.Error(w, "forbidden target", http.StatusForbidden)
+				return
+			}
+			http.Error(w, "bad u param", http.StatusBadRequest)
 			return
 		}
-		http.Error(w, "bad u param", http.StatusBadRequest)
-		return
-	}
 
-	h.svc.serve(r.Context(), w, r.Header, streamReq.Target)
+		f.svc.serve(r.Context(), w, r.Header, streamReq.Target)
+	})
 }

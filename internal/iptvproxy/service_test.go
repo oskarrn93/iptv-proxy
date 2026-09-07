@@ -17,7 +17,6 @@ func newTestService(t *testing.T, upstream string) *feedService {
 	t.Helper()
 	cfg := FeedConfig{
 		Name:        "test",
-		ListenAddr:  ":0",
 		UpstreamURL: upstream,
 		Username:    "alice",
 		Password:    "secret",
@@ -52,7 +51,6 @@ func TestNewFeedService_ValidUpstreamURL(t *testing.T) {
 func TestRewritePlaylist_PublicBaseURL(t *testing.T) {
 	cfg := FeedConfig{
 		Name:          "test",
-		ListenAddr:    ":0",
 		UpstreamURL:   "http://upstream.example.com/get.php",
 		PublicBaseURL: "http://public.example.com:58034/",
 		Username:      "alice",
@@ -89,7 +87,6 @@ func TestRewritePlaylist(t *testing.T) {
 func TestRewritePlaylist_ExcludeGroupPrefixes(t *testing.T) {
 	cfg := FeedConfig{
 		Name:                 "test",
-		ListenAddr:           ":0",
 		UpstreamURL:          "http://upstream.example.com/get.php",
 		ExcludeGroupPrefixes: []string{"movies:", "series:"},
 		Username:             "alice",
