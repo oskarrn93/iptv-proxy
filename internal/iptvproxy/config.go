@@ -16,6 +16,11 @@ import (
 // each served on its own listen address/port within this one process.
 type Config struct {
 	Feeds []FeedConfig `yaml:"feeds" validate:"min=1,unique=ListenAddr,dive"`
+	// HealthAddr, when set, serves a single aggregated /health endpoint that
+	// probes every feed's own /health route, so operators (and the container
+	// healthcheck) can poll one port instead of one per feed. Optional: with
+	// no value set, only each feed's own /health is served.
+	HealthAddr string `yaml:"health_addr"`
 }
 
 type FeedConfig struct {

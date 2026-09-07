@@ -93,6 +93,29 @@ func run() int {
 		}()
 	}
 
+	if cfg.HealthAddr != "" {
+		aggregator, err := iptvproxy.NewHealthAggregator(cfg.Feeds)
+		if err != nil {
+			logger.Error("health aggregator setup failed", "error", err)
+			return 1
+		}
+		srv := &http.Server{
+			Addr:        cfg.HealthAddr,
+			Handler:     aggregator,
+			ReadTimeout: 10 * time.Second,
+		}
+		servers = append(servers, srv)
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			logger.Info("listening", "feed", "health", "addr", srv.Addr)
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serveErrs <- fmt.Errorf("health aggregator: %w", err)
+			}
+		}()
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 

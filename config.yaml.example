@@ -2,6 +2,12 @@
 # One entry per M3U8 feed; each gets its own listen port within this
 # single process/container. Point IPTV apps at:
 #   http://<host>:<listen_port>/playlist.m3u8?username=<username>&password=<password>
+
+# Optional: serves one aggregated /health that probes every feed's own
+# /health, so a single port can be polled instead of one per feed. Omit to
+# skip it and rely on each feed's own /health only.
+health_addr: ":58033"
+
 feeds:
   - name: feed-1
     listen_addr: ":58034"
