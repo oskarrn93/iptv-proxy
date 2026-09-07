@@ -2,6 +2,7 @@ package iptvproxy
 
 import (
 	"crypto/subtle"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -43,8 +44,7 @@ func (h *FeedHandler) Mux() *http.ServeMux {
 	mux.HandleFunc("/stream", h.instrument(routeStream, h.withRequestLogger(h.handleStream)))
 	mux.HandleFunc("/health", h.instrument(routeHealth, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, max-age=0")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		writeHealthStatus(w, h.health())
 	}))
 	mux.Handle("/metrics", h.metrics.handler())
 	return mux
@@ -109,6 +109,12 @@ func (h *FeedHandler) requireAuth(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
+// health reports this feed's own liveness, independent of how it gets
+// rendered to an HTTP response.
+func (h *FeedHandler) health() HealthStatus {
+	return HealthStatus{Healthy: true}
+}
+
 // handlePlaylist serves the feed's own top-level playlist (the configured
 // upstream_url). Clients point their IPTV app at this URL instead of the
 // real upstream.
@@ -128,22 +134,18 @@ func (h *FeedHandler) handleStream(w http.ResponseWriter, r *http.Request) {
 	if !h.requireAuth(w, r) {
 		return
 	}
-	raw := r.URL.Query().Get("u")
-	if raw == "" {
-		http.Error(w, "missing u", http.StatusBadRequest)
-		return
-	}
-	target, err := h.svc.resolveStreamTarget(raw)
+	streamReq, err := h.svc.parseStreamRequest(r.Context(), r.URL.Query().Get("u"))
 	if err != nil {
+		var reqErr *StreamRequestError
+		if errors.As(err, &reqErr) && reqErr.Forbidden {
+			loggerFromContext(r.Context(), h.logger).WarnContext(r.Context(), "rejected stream target",
+				"remote_addr", r.RemoteAddr, "error", err)
+			http.Error(w, "forbidden target", http.StatusForbidden)
+			return
+		}
 		http.Error(w, "bad u param", http.StatusBadRequest)
 		return
 	}
-	if err := h.svc.validateStreamTarget(r.Context(), target); err != nil {
-		loggerFromContext(r.Context(), h.logger).WarnContext(r.Context(), "rejected stream target",
-			"remote_addr", r.RemoteAddr, "error", err)
-		http.Error(w, "forbidden target", http.StatusForbidden)
-		return
-	}
 
-	h.svc.serve(r.Context(), w, r.Header, target)
+	h.svc.serve(r.Context(), w, r.Header, streamReq.Target)
 }

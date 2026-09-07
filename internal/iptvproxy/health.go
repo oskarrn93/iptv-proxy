@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -41,9 +40,10 @@ func NewHealthAggregator(feeds []FeedConfig) (*HealthAggregator, error) {
 	}, nil
 }
 
-func (a *HealthAggregator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store, max-age=0")
-
+// Check probes every feed and reports the aggregate result as a HealthStatus,
+// with no knowledge of HTTP at all — ServeHTTP is the only place that
+// translates this into a response.
+func (a *HealthAggregator) Check(ctx context.Context) HealthStatus {
 	var (
 		mu        sync.Mutex
 		unhealthy []string
@@ -53,7 +53,7 @@ func (a *HealthAggregator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(name, target string) {
 			defer wg.Done()
-			if !a.probe(r.Context(), target) {
+			if !a.probe(ctx, target) {
 				mu.Lock()
 				unhealthy = append(unhealthy, name)
 				mu.Unlock()
@@ -62,16 +62,15 @@ func (a *HealthAggregator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 
-	if len(unhealthy) == 0 {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-		return
-	}
 	// Sorted so the response is stable across runs rather than depending on
 	// goroutine scheduling order.
 	sort.Strings(unhealthy)
-	w.WriteHeader(http.StatusServiceUnavailable)
-	fmt.Fprintf(w, "unhealthy feeds: %s\n", strings.Join(unhealthy, ", "))
+	return HealthStatus{Healthy: len(unhealthy) == 0, Unhealthy: unhealthy}
+}
+
+func (a *HealthAggregator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	writeHealthStatus(w, a.Check(r.Context()))
 }
 
 func (a *HealthAggregator) probe(ctx context.Context, target string) bool {

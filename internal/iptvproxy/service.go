@@ -74,6 +74,23 @@ func (s *feedService) resolveStreamTarget(raw string) (*url.URL, error) {
 	return target, nil
 }
 
+// parseStreamRequest parses and validates a /stream request's raw "u" param
+// into a StreamRequest, with no knowledge of HTTP at all — handleStream is
+// the only place that translates the result (or its error) into a response.
+func (s *feedService) parseStreamRequest(ctx context.Context, raw string) (StreamRequest, error) {
+	if raw == "" {
+		return StreamRequest{}, &StreamRequestError{Err: errors.New("missing u")}
+	}
+	target, err := s.resolveStreamTarget(raw)
+	if err != nil {
+		return StreamRequest{}, &StreamRequestError{Err: err}
+	}
+	if err := s.validateStreamTarget(ctx, target); err != nil {
+		return StreamRequest{}, &StreamRequestError{Forbidden: true, Err: err}
+	}
+	return StreamRequest{Target: target}, nil
+}
+
 // validateStreamTarget guards the /stream?u= relay. This container runs in the
 // vpn container's network namespace, so without a check any client holding
 // feed credentials could use it to read arbitrary LAN URLs. The configured
