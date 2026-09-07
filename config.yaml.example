@@ -1,0 +1,16 @@
+# Copy to config.yaml (gitignored) and fill in real values.
+# One entry per M3U8 feed; each gets its own listen port within this
+# single process/container. Point IPTV apps at:
+#   http://<host>:<listen_port>/playlist.m3u8?username=<username>&password=<password>
+feeds:
+  - name: feed-1
+    listen_addr: ":58034"
+    upstream_url: "http://provider.example.com:8080/get.php?username=UPSTREAM_USER&password=UPSTREAM_PASS&type=m3u_plus&output=ts"
+    username: proxyuser1
+    password: proxypass1
+
+  - name: feed-2
+    listen_addr: ":58035"
+    upstream_url: "http://provider.example.com:8080/get.php?username=UPSTREAM_USER&password=UPSTREAM_PASS&type=m3u_plus&output=ts"
+    username: proxyuser2
+    password: proxypass2

@@ -1,0 +1,4 @@
+# config.yaml holds real upstream Xtream credentials and is mounted into the
+# container at runtime — keep it out of the build context so it never lands in
+# a build layer or the local builder cache.
+config.yaml
