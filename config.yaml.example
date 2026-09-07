@@ -8,15 +8,28 @@
 # skip it and rely on each feed's own /health only.
 health_addr: ":58033"
 
+# public_base_url should be set to the address IPTV apps actually reach this
+# feed at (its listen_addr's public host:port). Rewritten /stream links are
+# otherwise served as paths relative to that address, which most players
+# reject the whole playlist over since a plain M3U channel list (unlike an
+# HLS sub-playlist) has no base URI to resolve a relative entry against.
+# exclude_group_prefixes drops any entry whose group-title starts with one of
+# these (case-insensitive) — e.g. an Xtream m3u_plus feed's "Movies: <genre>"
+# and "Series: <show>" VOD categories, keeping only live channels. Omit to
+# keep everything.
 feeds:
   - name: feed-1
     listen_addr: ":58034"
+    public_base_url: "http://your-host.example.com:58034"
+    exclude_group_prefixes: ["movies:", "series:"]
     upstream_url: "http://provider.example.com:8080/get.php?username=UPSTREAM_USER&password=UPSTREAM_PASS&type=m3u_plus&output=ts"
     username: proxyuser1
     password: proxypass1
 
   - name: feed-2
     listen_addr: ":58035"
+    public_base_url: "http://your-host.example.com:58035"
+    exclude_group_prefixes: ["movies:", "series:"]
     upstream_url: "http://provider.example.com:8080/get.php?username=UPSTREAM_USER&password=UPSTREAM_PASS&type=m3u_plus&output=ts"
     username: proxyuser2
     password: proxypass2

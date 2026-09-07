@@ -21,17 +21,19 @@ type upstreamRepository struct {
 	client *http.Client
 }
 
-func newUpstreamRepository(logger *slog.Logger) *upstreamRepository {
+func newUpstreamRepository(logger *slog.Logger, timeout time.Duration) *upstreamRepository {
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
+		ForceAttemptHTTP2:   true,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		// Tied to the feed's own configured timeout so it never becomes a
+		// tighter bottleneck than the per-request context deadline below.
+		ResponseHeaderTimeout: timeout,
 		ExpectContinueTimeout: 1 * time.Second,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   10,

@@ -6,6 +6,7 @@ require (
 	github.com/go-playground/validator/v10 v10.30.4
 	github.com/prometheus/client_golang v1.20.5
 	github.com/stretchr/testify v1.9.0
+	golang.org/x/sync v0.22.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

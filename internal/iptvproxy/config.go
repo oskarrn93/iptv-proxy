@@ -30,6 +30,20 @@ type FeedConfig struct {
 	Username    string        `yaml:"username" validate:"required"`
 	Password    string        `yaml:"password" validate:"required"`
 	Timeout     time.Duration `yaml:"timeout"`
+	// PublicBaseURL, when set, is prepended to every rewritten /stream link
+	// (e.g. "http://server.example.com:58034") so the served playlist's
+	// channel entries are absolute URLs instead of paths relative to this
+	// feed's own listen_addr. A plain M3U channel list (unlike an HLS media
+	// sub-playlist) has no notion of a base URI to resolve a relative entry
+	// against, so most IPTV players reject the whole file as invalid unless
+	// this is set. Left empty, entries stay relative for backward
+	// compatibility.
+	PublicBaseURL string `yaml:"public_base_url" validate:"omitempty,http_url"`
+	// ExcludeGroupPrefixes drops any playlist entry whose group-title starts
+	// with one of these prefixes (case-insensitive), e.g. ["movies:", "series:"]
+	// to strip VOD out of an Xtream m3u_plus feed and keep only live channels.
+	// Left empty, every entry is kept.
+	ExcludeGroupPrefixes []string `yaml:"exclude_group_prefixes"`
 }
 
 var validate = validator.New(validator.WithRequiredStructEnabled())
@@ -37,11 +51,12 @@ var validate = validator.New(validator.WithRequiredStructEnabled())
 // feedYAMLKey maps a FeedConfig struct field name to its config.yaml key, so
 // validation errors read in terms of the file the operator actually edited.
 var feedYAMLKey = map[string]string{
-	"Name":        "name",
-	"ListenAddr":  "listen_addr",
-	"UpstreamURL": "upstream_url",
-	"Username":    "username",
-	"Password":    "password",
+	"Name":          "name",
+	"ListenAddr":    "listen_addr",
+	"UpstreamURL":   "upstream_url",
+	"Username":      "username",
+	"Password":      "password",
+	"PublicBaseURL": "public_base_url",
 }
 
 // feedIndexPattern extracts the slice index from a validator namespace like

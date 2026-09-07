@@ -47,6 +47,17 @@ var forwardedRequestHeaders = []string{"Range", "If-Range", "Accept", "User-Agen
 // non-playlist bodies so ranged/seekable responses stay intact.
 var forwardedResponseHeaders = []string{"Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"}
 
+// lowercaseAll lowercases each string in ss, so a case-insensitive prefix
+// list only needs its comparisons done once at config-load time rather than
+// once per playlist line.
+func lowercaseAll(ss []string) []string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = strings.ToLower(s)
+	}
+	return out
+}
+
 func resolveURI(base *url.URL, uri string) (*url.URL, error) {
 	u, err := url.Parse(uri)
 	if err != nil {

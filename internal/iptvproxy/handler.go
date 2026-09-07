@@ -23,7 +23,7 @@ type FeedHandler struct {
 func NewFeedProxy(cfg FeedConfig, logger *slog.Logger, metricsEnabled bool) (*FeedHandler, error) {
 	logger = logger.With("feed", cfg.Name)
 	metrics := newFeedMetrics(cfg.Name, metricsEnabled, logger)
-	repo := newUpstreamRepository(logger)
+	repo := newUpstreamRepository(logger, cfg.Timeout)
 	svc, err := newFeedService(cfg, repo, logger, metrics)
 	if err != nil {
 		return nil, err
@@ -125,7 +125,7 @@ func (h *FeedHandler) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	loggerFromContext(r.Context(), h.logger).InfoContext(r.Context(), "playlist request",
 		"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
 
-	h.svc.serve(r.Context(), w, r.Header, h.svc.playlistTarget())
+	h.svc.servePlaylist(r.Context(), w, r.Header)
 }
 
 // handleStream serves rewritten segment/sub-playlist links produced by
