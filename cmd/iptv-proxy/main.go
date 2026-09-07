@@ -17,7 +17,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,12 +33,14 @@ func main() {
 }
 
 func run() int {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
 	configPath := flag.String("config", "config.yaml", "path to config.yaml")
 	flag.Parse()
 
 	cfg, err := iptvproxy.LoadConfig(*configPath)
 	if err != nil {
-		log.Printf("config error: %v", err)
+		logger.Error("config error", "error", err)
 		return 1
 	}
 
@@ -50,9 +52,9 @@ func run() int {
 	var wg sync.WaitGroup
 
 	for _, feedCfg := range cfg.Feeds {
-		proxy, err := iptvproxy.NewFeedProxy(feedCfg)
+		proxy, err := iptvproxy.NewFeedProxy(feedCfg, logger)
 		if err != nil {
-			log.Printf("feed %q: %v", feedCfg.Name, err)
+			logger.Error("feed setup failed", "feed", feedCfg.Name, "error", err)
 			return 1
 		}
 
@@ -70,7 +72,7 @@ func run() int {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			log.Printf("[%s] listening on %s", feedCfg.Name, srv.Addr)
+			logger.Info("listening", "feed", feedCfg.Name, "addr", srv.Addr)
 			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				serveErrs <- fmt.Errorf("feed %q: %w", feedCfg.Name, err)
 			}
@@ -83,9 +85,9 @@ func run() int {
 	exitCode := 0
 	select {
 	case sig := <-sigCh:
-		log.Printf("received signal %s, shutting down", sig)
+		logger.Info("received signal, shutting down", "signal", sig.String())
 	case err := <-serveErrs:
-		log.Printf("fatal: %v, shutting down", err)
+		logger.Error("fatal error, shutting down", "error", err)
 		exitCode = 1
 	}
 
@@ -93,7 +95,7 @@ func run() int {
 	defer cancel()
 	for _, srv := range servers {
 		if err := srv.Shutdown(ctx); err != nil {
-			log.Printf("shutdown error: %v", err)
+			logger.Error("shutdown error", "error", err)
 		}
 	}
 
