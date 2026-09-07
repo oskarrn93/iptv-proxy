@@ -10,7 +10,7 @@ package main
 //
 // Usage:
 //
-//	go run . -config config.yaml
+//	go run ./cmd/iptv-proxy -config config.yaml
 
 import (
 	"context"
@@ -24,6 +24,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/oskarrn93/media-services/iptv-proxy/internal/iptvproxy"
 )
 
 func main() {
@@ -34,7 +36,7 @@ func run() int {
 	configPath := flag.String("config", "config.yaml", "path to config.yaml")
 	flag.Parse()
 
-	cfg, err := loadConfig(*configPath)
+	cfg, err := iptvproxy.LoadConfig(*configPath)
 	if err != nil {
 		log.Printf("config error: %v", err)
 		return 1
@@ -48,7 +50,7 @@ func run() int {
 	var wg sync.WaitGroup
 
 	for _, feedCfg := range cfg.Feeds {
-		proxy, err := newFeedProxy(feedCfg)
+		proxy, err := iptvproxy.NewFeedProxy(feedCfg)
 		if err != nil {
 			log.Printf("feed %q: %v", feedCfg.Name, err)
 			return 1
@@ -56,7 +58,7 @@ func run() int {
 
 		srv := &http.Server{
 			Addr:        feedCfg.ListenAddr,
-			Handler:     proxy.mux(),
+			Handler:     proxy.Mux(),
 			ReadTimeout: 10 * time.Second,
 			// No WriteTimeout: a live TS relay writes for as long as the viewer
 			// watches, and any deadline here would cut it off mid-stream.

@@ -1,4 +1,4 @@
-package main
+package iptvproxy
 
 import (
 	"bufio"
@@ -26,10 +26,10 @@ const (
 	maxReconnects = 3
 )
 
-// feedProxy proxies one upstream M3U8 feed, rewriting every playlist/segment
+// FeedProxy proxies one upstream M3U8 feed, rewriting every playlist/segment
 // URI to route back through this feed's own listen address so the upstream
 // URL (and its embedded Xtream credentials) never reaches the client.
-type feedProxy struct {
+type FeedProxy struct {
 	name     string
 	target   *url.URL
 	username string
@@ -42,7 +42,7 @@ type feedProxy struct {
 	creds string
 }
 
-func newFeedProxy(cfg FeedConfig) (*feedProxy, error) {
+func NewFeedProxy(cfg FeedConfig) (*FeedProxy, error) {
 	target, err := url.Parse(cfg.UpstreamURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid upstream_url: %w", err)
@@ -69,7 +69,7 @@ func newFeedProxy(cfg FeedConfig) (*feedProxy, error) {
 		MaxIdleConnsPerHost:   10,
 	}
 
-	return &feedProxy{
+	return &FeedProxy{
 		name:     cfg.Name,
 		target:   target,
 		username: cfg.Username,
@@ -81,7 +81,7 @@ func newFeedProxy(cfg FeedConfig) (*feedProxy, error) {
 	}, nil
 }
 
-func (p *feedProxy) mux() *http.ServeMux {
+func (p *FeedProxy) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/playlist.m3u8", p.handlePlaylist)
 	mux.HandleFunc("/", p.handlePlaylist)
@@ -96,7 +96,7 @@ func (p *feedProxy) mux() *http.ServeMux {
 
 // requireAuth accepts either ?username=&password= query params or HTTP Basic
 // Auth so both "M3U URL" and "Xtream login" style IPTV apps work.
-func (p *feedProxy) requireAuth(w http.ResponseWriter, r *http.Request) bool {
+func (p *FeedProxy) requireAuth(w http.ResponseWriter, r *http.Request) bool {
 	user := r.URL.Query().Get("username")
 	pass := r.URL.Query().Get("password")
 	if user == "" && pass == "" {
@@ -141,7 +141,7 @@ var forwardedRequestHeaders = []string{"Range", "If-Range", "Accept", "User-Agen
 // non-playlist bodies so ranged/seekable responses stay intact.
 var forwardedResponseHeaders = []string{"Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"}
 
-func (p *feedProxy) fetchUpstream(ctx context.Context, rawURL string, hdr http.Header) (*http.Response, error) {
+func (p *FeedProxy) fetchUpstream(ctx context.Context, rawURL string, hdr http.Header) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
@@ -180,7 +180,7 @@ func isRetryableStatus(status int) bool {
 	}
 }
 
-func (p *feedProxy) fetchUpstreamWithRetry(ctx context.Context, rawURL string, hdr http.Header) (*http.Response, error) {
+func (p *FeedProxy) fetchUpstreamWithRetry(ctx context.Context, rawURL string, hdr http.Header) (*http.Response, error) {
 	wait := retryDelay
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		resp, err := p.fetchUpstream(ctx, rawURL, hdr)
@@ -301,7 +301,7 @@ func bufferedCopy(w http.ResponseWriter, r io.Reader) (int64, error) {
 // rewritePlaylist rewrites every segment/sub-playlist/EXT-X-KEY/EXT-X-MAP URI
 // in the playlist into a link back through this feed's own /stream endpoint,
 // carrying the proxy's own credentials so the upstream URL never leaks.
-func (p *feedProxy) rewritePlaylist(body []byte, srcURL *url.URL) (string, error) {
+func (p *FeedProxy) rewritePlaylist(body []byte, srcURL *url.URL) (string, error) {
 	// bytes.NewReader, not strings.NewReader(string(body)): the latter copies the
 	// whole playlist, and a full Xtream channel list runs to tens of megabytes.
 	scanner := bufio.NewScanner(bytes.NewReader(body))
@@ -338,7 +338,7 @@ func (p *feedProxy) rewritePlaylist(body []byte, srcURL *url.URL) (string, error
 // writeStreamURI writes the /stream link that stands in for one upstream URI.
 // Explicit writes rather than fmt.Fprintf: this runs once per playlist line, and
 // a full channel list is tens of thousands of lines.
-func (p *feedProxy) writeStreamURI(out *strings.Builder, resolved *url.URL) {
+func (p *FeedProxy) writeStreamURI(out *strings.Builder, resolved *url.URL) {
 	out.WriteString("/stream?u=")
 	out.WriteString(url.QueryEscape(resolved.String()))
 	out.WriteByte('&')
@@ -354,7 +354,7 @@ var attrURIPattern = regexp.MustCompile(`(?i)URI=(?:"[^"]*"|'[^']*')`)
 // #EXT-X-MAP line. ReplaceAllStringFunc scans the original line left to right
 // and never re-examines what it substitutes in, so a replacement that itself
 // begins with `URI=` cannot be re-wrapped.
-func (p *feedProxy) rewriteAttrURI(line string, base *url.URL) string {
+func (p *FeedProxy) rewriteAttrURI(line string, base *url.URL) string {
 	return attrURIPattern.ReplaceAllStringFunc(line, func(match string) string {
 		// match is `URI=` + delimiter + value + the same delimiter.
 		delim := match[len("URI=")]
@@ -377,7 +377,7 @@ func (p *feedProxy) rewriteAttrURI(line string, base *url.URL) string {
 // feed credentials could use it to read arbitrary LAN URLs. The configured
 // upstream host is always allowed; anything else must resolve to a public
 // address.
-func (p *feedProxy) validateStreamTarget(ctx context.Context, target *url.URL) error {
+func (p *FeedProxy) validateStreamTarget(ctx context.Context, target *url.URL) error {
 	if target.Scheme != "http" && target.Scheme != "https" {
 		return fmt.Errorf("unsupported scheme %q", target.Scheme)
 	}
@@ -404,7 +404,7 @@ func (p *feedProxy) validateStreamTarget(ctx context.Context, target *url.URL) e
 // upstreamContext gives finite responses a deadline and leaves live TS streams
 // without one. It runs before the fetch, so the path is the only signal
 // available — hence isTSPath rather than the full isTSStream.
-func (p *feedProxy) upstreamContext(reqCtx context.Context, target *url.URL) (context.Context, context.CancelFunc) {
+func (p *FeedProxy) upstreamContext(reqCtx context.Context, target *url.URL) (context.Context, context.CancelFunc) {
 	if isTSPath(target) {
 		return reqCtx, func() {}
 	}
@@ -414,7 +414,7 @@ func (p *feedProxy) upstreamContext(reqCtx context.Context, target *url.URL) (co
 // handlePlaylist serves the feed's own top-level playlist (the configured
 // upstream_url). Clients point their IPTV app at this URL instead of the
 // real upstream.
-func (p *feedProxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
+func (p *FeedProxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	if !p.requireAuth(w, r) {
 		return
 	}
@@ -425,7 +425,7 @@ func (p *feedProxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 
 // handleStream serves rewritten segment/sub-playlist links produced by
 // rewritePlaylist, fetching whatever upstream URL is given in "u".
-func (p *feedProxy) handleStream(w http.ResponseWriter, r *http.Request) {
+func (p *FeedProxy) handleStream(w http.ResponseWriter, r *http.Request) {
 	if !p.requireAuth(w, r) {
 		return
 	}
@@ -448,7 +448,7 @@ func (p *feedProxy) handleStream(w http.ResponseWriter, r *http.Request) {
 	p.proxyTarget(w, r, target)
 }
 
-func (p *feedProxy) proxyTarget(w http.ResponseWriter, r *http.Request, target *url.URL) {
+func (p *FeedProxy) proxyTarget(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	tctx, cancel := p.upstreamContext(r.Context(), target)
 	defer cancel()
 	resp, err := p.fetchUpstreamWithRetry(tctx, target.String(), r.Header)
@@ -541,7 +541,7 @@ type readCloserWrapper struct {
 // counting it this loop would refetch without pause forever. The budget resets
 // whenever a connection actually delivered data, so a stream that survives for
 // hours can still reconnect more than maxReconnects times in total.
-func (p *feedProxy) streamRawTSWithReconnect(ctx context.Context, w http.ResponseWriter, target *url.URL, initialBody io.ReadCloser) error {
+func (p *FeedProxy) streamRawTSWithReconnect(ctx context.Context, w http.ResponseWriter, target *url.URL, initialBody io.ReadCloser) error {
 	currentBody := initialBody
 	defer func() {
 		if currentBody != nil {

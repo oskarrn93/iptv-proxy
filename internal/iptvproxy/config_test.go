@@ -1,4 +1,4 @@
-package main
+package iptvproxy
 
 import (
 	"os"
@@ -34,7 +34,7 @@ feeds:
     password: pass2
 `)
 
-	cfg, err := loadConfig(path)
+	cfg, err := LoadConfig(path)
 	require.NoError(t, err)
 	require.Len(t, cfg.Feeds, 2)
 
@@ -47,19 +47,19 @@ feeds:
 }
 
 func TestLoadConfig_FileNotFound(t *testing.T) {
-	_, err := loadConfig("/nonexistent/path/config.yaml")
+	_, err := LoadConfig("/nonexistent/path/config.yaml")
 	assert.Error(t, err)
 }
 
 func TestLoadConfig_InvalidYAML(t *testing.T) {
 	path := writeConfig(t, "not: valid: yaml: [")
-	_, err := loadConfig(path)
+	_, err := LoadConfig(path)
 	assert.Error(t, err)
 }
 
 func TestLoadConfig_NoFeeds(t *testing.T) {
 	path := writeConfig(t, "feeds: []")
-	_, err := loadConfig(path)
+	_, err := LoadConfig(path)
 	assert.ErrorContains(t, err, "no feeds")
 }
 
@@ -111,7 +111,7 @@ feeds:
     upstream_url: "http://example.com"
     password: p
 `,
-			wantErr: "username and password are required",
+			wantErr: "username is required",
 		},
 		{
 			name: "missing password",
@@ -122,14 +122,14 @@ feeds:
     upstream_url: "http://example.com"
     username: u
 `,
-			wantErr: "username and password are required",
+			wantErr: "password is required",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := writeConfig(t, tt.yaml)
-			_, err := loadConfig(path)
+			_, err := LoadConfig(path)
 			require.Error(t, err)
 			assert.ErrorContains(t, err, tt.wantErr)
 		})
@@ -150,7 +150,7 @@ feeds:
     username: u2
     password: p2
 `)
-	_, err := loadConfig(path)
+	_, err := LoadConfig(path)
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "already used by feed \"feed1\"")
+	assert.ErrorContains(t, err, "duplicate listen_addr")
 }

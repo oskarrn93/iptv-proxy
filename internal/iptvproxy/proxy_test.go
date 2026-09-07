@@ -1,4 +1,4 @@
-package main
+package iptvproxy
 
 import (
 	"context"
@@ -15,9 +15,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newTestProxy(t *testing.T, upstream string) *feedProxy {
+func newTestProxy(t *testing.T, upstream string) *FeedProxy {
 	t.Helper()
-	p, err := newFeedProxy(FeedConfig{
+	p, err := NewFeedProxy(FeedConfig{
 		Name:        "test",
 		ListenAddr:  ":0",
 		UpstreamURL: upstream,
@@ -38,7 +38,7 @@ func TestNewFeedProxy_InvalidUpstreamURL(t *testing.T) {
 	}
 	for _, u := range tests {
 		t.Run(u, func(t *testing.T) {
-			_, err := newFeedProxy(FeedConfig{Name: "f", UpstreamURL: u, Username: "a", Password: "b"})
+			_, err := NewFeedProxy(FeedConfig{Name: "f", UpstreamURL: u, Username: "a", Password: "b"})
 			assert.Error(t, err)
 		})
 	}
@@ -360,7 +360,7 @@ func TestHealthEndpoint(t *testing.T) {
 	p := newTestProxy(t, "http://upstream.example.com/get.php")
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
-	p.mux().ServeHTTP(rec, req)
+	p.Mux().ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "ok", rec.Body.String())
