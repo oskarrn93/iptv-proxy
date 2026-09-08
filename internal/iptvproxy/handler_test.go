@@ -5,9 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,26 +15,28 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func newTestProxy(t *testing.T, upstream string) *Proxy {
+// newProxyWith builds a Proxy over the given feeds, holding the Config and
+// NewProxy plumbing that every proxy test would otherwise repeat.
+func newProxyWith(t *testing.T, metricsEnabled bool, feeds ...FeedConfig) *Proxy {
 	t.Helper()
-	p, err := NewProxy(&Config{
-		ListenAddr: ":0",
-		Feeds: []FeedConfig{{
-			Name:        "test",
-			UpstreamURL: upstream,
-			Username:    "alice",
-			Password:    "secret",
-			Timeout:     5 * time.Second,
-		}},
-	}, testLogger(), true)
+	p, err := NewProxy(&Config{ListenAddr: ":0", Feeds: feeds}, testLogger(), metricsEnabled)
 	require.NoError(t, err)
 	return p
+}
+
+func newTestProxy(t *testing.T, upstream string) *Proxy {
+	t.Helper()
+	return newProxyWith(t, true, testFeedConfig(upstream))
 }
 
 func TestNewProxy_InvalidUpstreamURL(t *testing.T) {
 	_, err := NewProxy(&Config{
 		ListenAddr: ":0",
-		Feeds:      []FeedConfig{{Name: "f", UpstreamURL: "not a url", Username: "a", Password: "b"}},
+		Feeds: []FeedConfig{{
+			Name:        "f",
+			UpstreamURL: "not a url",
+			Credentials: Credentials{Username: "a", Password: "b"},
+		}},
 	}, testLogger(), true)
 	assert.Error(t, err)
 }
@@ -73,14 +73,10 @@ func TestAuthenticate(t *testing.T) {
 }
 
 func TestAuthenticate_MultipleFeeds(t *testing.T) {
-	p, err := NewProxy(&Config{
-		ListenAddr: ":0",
-		Feeds: []FeedConfig{
-			{Name: "feed-1", UpstreamURL: "http://upstream1.example.com/get.php", Username: "alice", Password: "secret1"},
-			{Name: "feed-2", UpstreamURL: "http://upstream2.example.com/get.php", Username: "bob", Password: "secret2"},
-		},
-	}, testLogger(), true)
-	require.NoError(t, err)
+	p := newProxyWith(t, true,
+		FeedConfig{Name: "feed-1", UpstreamURL: "http://upstream1.example.com/get.php", Credentials: Credentials{Username: "alice", Password: "secret1"}},
+		FeedConfig{Name: "feed-2", UpstreamURL: "http://upstream2.example.com/get.php", Credentials: Credentials{Username: "bob", Password: "secret2"}},
+	)
 
 	req := httptest.NewRequest(http.MethodGet, "/playlist.m3u8?username=bob&password=secret2", nil)
 	rec := httptest.NewRecorder()
@@ -90,13 +86,20 @@ func TestAuthenticate_MultipleFeeds(t *testing.T) {
 }
 
 func TestHandlePlaylist_RewritesAndRequiresAuth(t *testing.T) {
+	// The upstream's own response embeds Xtream-style credentials in the
+	// segment path, same as writeStreamURI's own client-facing link will —
+	// this is what must never come through unrewritten.
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		_, _ = w.Write([]byte("#EXTM3U\nsegment1.ts\n"))
+		_, _ = w.Write([]byte("#EXTM3U\n/live/xtreamuser/xtreampass/segment1.ts\n"))
 	}))
 	defer upstream.Close()
 
-	p := newTestProxy(t, upstream.URL+"/get.php")
+	// The upstream's credentials have to be the ones the config declares:
+	// swapping them out of a rewritten link is only possible for credentials
+	// the proxy knows about, which for an Xtream feed is exactly the pair its
+	// get.php URL carries.
+	p := newTestProxy(t, upstream.URL+"/get.php?username=xtreamuser&password=xtreampass")
 
 	t.Run("unauthorized without creds", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/playlist.m3u8", nil)
@@ -112,55 +115,60 @@ func TestHandlePlaylist_RewritesAndRequiresAuth(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, rec.Code)
 		body := rec.Body.String()
-		assert.Contains(t, body, "/stream?u=")
+		assert.Contains(t, body, "/live/") // link shape still mimics an Xtream stream URL
 		assert.NotContains(t, body, upstream.URL)
+		assert.NotContains(t, body, "xtreamuser") // upstream's own embedded username never leaks
+		assert.NotContains(t, body, "xtreampass") // upstream's own embedded password never leaks
 	})
 }
 
-func TestHandleStream_ForbidsPrivateTarget(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
-
-	p := newTestProxy(t, upstream.URL+"/get.php")
-
-	target := url.QueryEscape("http://127.0.0.1:9/secret")
-	req := httptest.NewRequest(http.MethodGet, "/stream?username=alice&password=secret&u="+target, nil)
-	rec := httptest.NewRecorder()
-	p.handleStream(rec, req)
-
-	assert.Equal(t, http.StatusForbidden, rec.Code)
+// streamRequest builds a stream request for the link
+// /<prefix>/<username>/<password>/<rest>, setting the path values directly
+// (via (*http.Request).SetPathValue, Go 1.22+) rather than routing through
+// p.Mux() first, since these tests call p.handleStream directly — ServeMux is
+// what would normally populate PathValue from the matched
+// /{prefix}/{username}/{password}/{rest...} pattern.
+func streamRequest(prefix, username, password, rest string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/"+prefix+"/"+username+"/"+password+"/"+rest, nil)
+	req.SetPathValue("prefix", prefix)
+	req.SetPathValue("username", username)
+	req.SetPathValue("password", password)
+	req.SetPathValue("rest", rest)
+	return req
 }
 
-func TestHandleStream_MissingOrBadTarget(t *testing.T) {
+func TestHandleStream_RejectsBadCredentials(t *testing.T) {
 	p := newTestProxy(t, "http://upstream.example.com/get.php")
 
-	t.Run("missing u param", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/stream?username=alice&password=secret", nil)
+	t.Run("no credentials in path", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/stream", nil)
 		rec := httptest.NewRecorder()
 		p.handleStream(rec, req)
-		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	})
 
-	t.Run("unparseable u param", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/stream?username=alice&password=secret&u=%zz", nil)
+	t.Run("unknown username", func(t *testing.T) {
+		req := streamRequest("live", "mallory", "secret", "0")
 		rec := httptest.NewRecorder()
 		p.handleStream(rec, req)
-		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	})
 
-	t.Run("relative u param", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/stream?username=alice&password=secret&u=relative.ts", nil)
+	t.Run("known username, wrong password", func(t *testing.T) {
+		req := streamRequest("live", "alice", "wrong", "0")
 		rec := httptest.NewRecorder()
 		p.handleStream(rec, req)
-		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	})
 }
 
+// TestHandleStream_ProxiesSegment walks a link end to end: the path carries
+// the feed's own credentials where the upstream's stood, and handleStream has
+// to put the upstream's back — reaching /live/xtreamuser/xtreampass/segment.ts
+// on the configured upstream, not the path the client actually requested.
 func TestHandleStream_ProxiesSegment(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/segment.ts" {
+		if r.URL.Path == "/live/xtreamuser/xtreampass/segment.ts" {
 			w.Header().Set("Content-Type", "video/mp2t")
 			_, _ = w.Write([]byte{0x47, 0x01, 0x02, 0x03})
 			return
@@ -169,15 +177,35 @@ func TestHandleStream_ProxiesSegment(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := newTestProxy(t, upstream.URL+"/get.php")
+	p := newTestProxy(t, upstream.URL+"/get.php?username=xtreamuser&password=xtreampass")
 
-	target := url.QueryEscape(upstream.URL + "/segment.ts")
-	req := httptest.NewRequest(http.MethodGet, "/stream?username=alice&password=secret&u="+target, nil)
 	rec := httptest.NewRecorder()
-	p.handleStream(rec, req)
+	p.handleStream(rec, streamRequest("live", "alice", "secret", "segment.ts"))
 
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, []byte{0x47, 0x01, 0x02, 0x03}, rec.Body.Bytes())
+}
+
+// TestHandleStream_CannotReachAnotherHost is the reason there is no separate
+// SSRF check on the /stream route: the target host comes from config, so
+// nothing a client puts in the path can steer the fetch off the configured
+// upstream, however it is spelled.
+func TestHandleStream_CannotReachAnotherHost(t *testing.T) {
+	var reached bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		assert.Equal(t, "/127.0.0.1:9/secret", r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream.URL+"/get.php")
+
+	rec := httptest.NewRecorder()
+	p.handleStream(rec, streamRequest("stream", "alice", "secret", "127.0.0.1:9/secret"))
+
+	assert.True(t, reached, "the configured upstream is the only host a stream request can reach")
+	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
 func TestHandlePlaylist_ForwardsUpstreamErrorStatus(t *testing.T) {
@@ -224,17 +252,7 @@ func TestMetricsEndpoint(t *testing.T) {
 }
 
 func TestMetricsEndpoint_Disabled(t *testing.T) {
-	p, err := NewProxy(&Config{
-		ListenAddr: ":0",
-		Feeds: []FeedConfig{{
-			Name:        "test",
-			UpstreamURL: "http://upstream.example.com/get.php",
-			Username:    "alice",
-			Password:    "secret",
-			Timeout:     5 * time.Second,
-		}},
-	}, testLogger(), false)
-	require.NoError(t, err)
+	p := newProxyWith(t, false, testFeedConfig("http://upstream.example.com/get.php"))
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()

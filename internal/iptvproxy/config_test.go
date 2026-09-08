@@ -40,6 +40,9 @@ feeds:
 
 	assert.Equal(t, "feed1", cfg.Feeds[0].Name)
 	assert.Equal(t, 30*time.Second, cfg.Feeds[0].Timeout)
+	// Credentials is embedded inline, so the pair still comes from a feed's
+	// own plain username:/password: keys rather than a nested mapping.
+	assert.Equal(t, Credentials{Username: "user1", Password: "pass1"}, cfg.Feeds[0].Credentials)
 
 	// Missing timeout defaults to 15s.
 	assert.Equal(t, "feed2", cfg.Feeds[1].Name)
@@ -73,7 +76,7 @@ feeds:
 `)
 	_, err := LoadConfig(path)
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "config has no feeds")
+	assert.ErrorContains(t, err, "listen_addr is required")
 }
 
 func TestLoadConfig_MissingRequiredFields(t *testing.T) {

@@ -2,13 +2,11 @@ package iptvproxy
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -34,27 +32,41 @@ const playlistGroupKey = "playlist"
 // per poll" to "once per TTL" per feed.
 const playlistCacheTTL = 3 * time.Hour
 
+// maxPlaylistGrow caps the up-front allocation rewritePlaylist sizes from the
+// upstream's Content-Length.
+const maxPlaylistGrow = 8 << 20
+
 // feedService holds one feed's business logic: which upstream URLs are safe
 // to fetch, how playlists get rewritten so the upstream URL (and any Xtream
 // credentials embedded in it) never reaches a client, and how to serve
 // playlists, VOD segments, and live TS streams. It fetches upstream content
 // through an upstreamRepository rather than an *http.Client directly.
 type feedService struct {
+	// name is the feed's configured name, used to label its logs and to say
+	// which feed a rejected request was attributed to.
+	name    string
 	target  *url.URL
 	timeout time.Duration
-	// creds is this feed's own username/password pre-encoded as a query
-	// fragment. It is stamped onto every rewritten playlist line, so it is
-	// built once per feed rather than once per line.
-	creds string
 	// publicBaseURL, when non-empty, is prepended to every rewritten /stream
 	// link so playlist entries are absolute URLs (see FeedConfig.PublicBaseURL).
 	publicBaseURL string
 	// excludeGroupPrefixes is cfg.ExcludeGroupPrefixes lowercased once here
 	// rather than per playlist line (see FeedConfig.ExcludeGroupPrefixes).
 	excludeGroupPrefixes []string
-	repo                 *upstreamRepository
-	logger               *slog.Logger
-	metrics              *feedMetrics
+	// hideCredentials swaps the upstream's own credentials out of a URL for
+	// this feed's; restoreCredentials swaps them back. Together they are what
+	// lets a rewritten link stand in for an upstream URL without carrying it:
+	// the link holds the feed's credentials in the exact spots the upstream's
+	// occupied, and streamTarget puts the upstream's back before fetching.
+	hideCredentials    credentialSwap
+	restoreCredentials credentialSwap
+	// creds are this feed's own configured credentials, written into every
+	// rewritten link (see writeStreamURI) and matched against an incoming
+	// /stream request to find the feed again.
+	creds   Credentials
+	repo    *upstreamRepository
+	logger  *slog.Logger
+	metrics *feedMetrics
 	// playlistGroup coalesces concurrent requests for this feed's playlist
 	// into a single upstream fetch — a channel list can be tens of megabytes,
 	// and IPTV apps routinely poll it every few seconds from multiple
@@ -63,9 +75,10 @@ type feedService struct {
 	// playlistCacheMu guards playlistCache/playlistCachedAt. Reads and writes
 	// happen outside playlistGroup's own critical section (a cache hit skips
 	// playlistGroup.Do entirely), so they need their own lock rather than
-	// riding on singleflight's.
+	// riding on singleflight's. A zero playlistCachedAt means nothing has been
+	// cached yet, so the entry needs no separate "is set" flag.
 	playlistCacheMu  sync.Mutex
-	playlistCache    *playlistFetchResult
+	playlistCache    playlistFetchResult
 	playlistCachedAt time.Time
 }
 
@@ -97,80 +110,67 @@ func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logge
 	if !target.IsAbs() || (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" {
 		return nil, fmt.Errorf("invalid upstream_url %q: must be an absolute http:// or https:// URL", cfg.UpstreamURL)
 	}
+	// An Xtream upstream carries its own credentials as get.php query params
+	// and repeats them in every stream path it hands out, so the configured
+	// upstream_url is all it takes to know what to swap out of a rewritten
+	// link — and back in when the request for it arrives. An upstream with no
+	// such credentials simply has nothing to swap; its links then carry the
+	// whole upstream path instead (see streamURIPathParts).
+	upstreamCreds := credentialsFromURL(target)
+
+	// A credential that a path spells differently than the config does would
+	// never match where it has to (see Credentials.unsafePathField): this
+	// feed's own would leave links no client could authenticate against, and
+	// the upstream's would stay in those links rather than being swapped out.
+	// Caught at startup instead of as unplayable channels or a quiet leak.
+	for _, pair := range []struct {
+		scope string
+		creds Credentials
+	}{
+		{"", cfg.Credentials},
+		{"upstream_url ", upstreamCreds},
+	} {
+		if field := pair.creds.unsafePathField(); field != "" {
+			return nil, fmt.Errorf("%s%s must be URL-path-safe: it has to survive a round trip through a stream link's path", pair.scope, field)
+		}
+	}
+
+	// The two swaps are exact mirrors of each other, so only one is spelled
+	// out: deriving the other states that relationship rather than leaving a
+	// reader to verify the field assignments line up.
+	hide := credentialSwap{from: upstreamCreds, to: cfg.Credentials}
 
 	return &feedService{
-		target:  target,
-		timeout: cfg.Timeout,
-		creds: fmt.Sprintf("username=%s&password=%s",
-			url.QueryEscape(cfg.Username), url.QueryEscape(cfg.Password)),
+		name:                 cfg.Name,
+		target:               target,
+		timeout:              cfg.Timeout,
 		publicBaseURL:        strings.TrimSuffix(cfg.PublicBaseURL, "/"),
 		excludeGroupPrefixes: lowercaseAll(cfg.ExcludeGroupPrefixes),
+		hideCredentials:      hide,
+		restoreCredentials:   hide.reversed(),
+		creds:                cfg.Credentials,
 		repo:                 repo,
 		logger:               logger,
 		metrics:              metrics,
 	}, nil
 }
 
-// playlistTarget is the feed's own top-level playlist (the configured
-// upstream_url).
-func (s *feedService) playlistTarget() *url.URL {
-	return s.target
+// matches reports whether creds are exactly this feed's own. The service that
+// writes credentials into rewritten links is the one that recognizes them
+// coming back, so the two can't drift apart.
+func (s *feedService) matches(creds Credentials) (userOK, passOK bool) {
+	return s.creds.matches(creds)
 }
 
-// resolveStreamTarget parses the "u" query param of a /stream request into an
-// absolute URL, without yet judging whether it's safe to fetch.
-func (s *feedService) resolveStreamTarget(raw string) (*url.URL, error) {
-	target, err := url.Parse(raw)
-	if err != nil || !target.IsAbs() {
-		return nil, errors.New("bad u param")
-	}
-	return target, nil
-}
-
-// parseStreamRequest parses and validates a /stream request's raw "u" param
-// into a StreamRequest, with no knowledge of HTTP at all — handleStream is
-// the only place that translates the result (or its error) into a response.
-func (s *feedService) parseStreamRequest(ctx context.Context, raw string) (StreamRequest, error) {
-	if raw == "" {
-		return StreamRequest{}, &StreamRequestError{Err: errors.New("missing u")}
-	}
-	target, err := s.resolveStreamTarget(raw)
-	if err != nil {
-		return StreamRequest{}, &StreamRequestError{Err: err}
-	}
-	if err := s.validateStreamTarget(ctx, target); err != nil {
-		return StreamRequest{}, &StreamRequestError{Forbidden: true, Err: err}
-	}
-	return StreamRequest{Target: target}, nil
-}
-
-// validateStreamTarget guards the /stream?u= relay. This container runs in the
-// vpn container's network namespace, so without a check any client holding
-// feed credentials could use it to read arbitrary LAN URLs. The configured
-// upstream host is always allowed; anything else must resolve to a public
-// address.
-func (s *feedService) validateStreamTarget(ctx context.Context, target *url.URL) error {
-	if target.Scheme != "http" && target.Scheme != "https" {
-		return fmt.Errorf("unsupported scheme %q", target.Scheme)
-	}
-	if strings.EqualFold(target.Host, s.target.Host) {
-		return nil
-	}
-	host := target.Hostname()
-	if host == "" {
-		return errors.New("missing host")
-	}
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return fmt.Errorf("resolving %q: %w", host, err)
-	}
-	for _, addr := range addrs {
-		ip := addr.IP
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
-			return fmt.Errorf("host %q resolves to non-public address %s", host, ip)
-		}
-	}
-	return nil
+// streamTarget rebuilds the upstream URL a rewritten stream link stands for:
+// this feed's configured upstream scheme and host, with the link's path and
+// query put back the way writeStreamURI found them. The host comes from config
+// and never from the request, so a /stream request can only ever reach the
+// configured upstream — which is why nothing here has to check that the target
+// isn't a LAN address.
+func (s *feedService) streamTarget(prefix, rest, rawQuery string) *url.URL {
+	path, query := s.restoreCredentials.apply(streamURIPath(prefix, s.creds, rest), rawQuery)
+	return &url.URL{Scheme: s.target.Scheme, Host: s.target.Host, Path: path, RawQuery: query}
 }
 
 // upstreamContext gives finite responses a deadline and leaves live TS streams
@@ -211,20 +211,31 @@ func (s *feedService) excludeEntry(extinfLine string) bool {
 
 // rewritePlaylist rewrites every segment/sub-playlist/EXT-X-KEY/EXT-X-MAP URI
 // in the playlist into a link back through this feed's own /stream endpoint,
-// carrying the proxy's own credentials so the upstream URL never leaks. It
-// also drops any #EXTINF entry (and its following URI line) whose group-title
-// matches excludeGroupPrefixes.
-func (s *feedService) rewritePlaylist(body []byte, srcURL *url.URL) (string, error) {
-	// bytes.NewReader, not strings.NewReader(string(body)): the latter copies the
-	// whole playlist, and a full Xtream channel list runs to tens of megabytes.
-	scanner := bufio.NewScanner(bytes.NewReader(body))
+// carrying this feed's credentials in place of the upstream's (see
+// writeStreamURI) — so neither the upstream host nor the credentials it embeds
+// reach the client. It also drops any #EXTINF entry (and its following URI
+// line) whose group-title matches excludeGroupPrefixes.
+// The reader is consumed strictly line by line, so a full channel list never
+// has to be held as one []byte — sizeHint is the upstream's Content-Length, or
+// <= 0 when it arrived chunked.
+func (s *feedService) rewritePlaylist(r io.Reader, srcURL *url.URL, sizeHint int64) (string, error) {
+	scanner := bufio.NewScanner(r)
 	// Open at 64 KB and let the scanner grow only if a line really needs it; the
 	// 1 MB is the safety cap, not the opening allocation.
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	var out strings.Builder
 	// The rewrite is roughly size-preserving, so sizing once up front beats
-	// letting the Builder double its way up to a multi-megabyte playlist.
-	out.Grow(len(body) + len(body)/4)
+	// letting the Builder double its way up to a multi-megabyte playlist. The
+	// hint is capped because excludeGroupPrefixes can drop the great majority
+	// of an Xtream m3u_plus list, and a 40 MB upstream that rewrites down to
+	// 2 MB shouldn't open with a 50 MB allocation.
+	if sizeHint > 0 {
+		grow := sizeHint + sizeHint/4
+		if grow > maxPlaylistGrow {
+			grow = maxPlaylistGrow
+		}
+		out.Grow(int(grow))
+	}
 
 	// skipURI is set by an excluded #EXTINF line so the URI line that follows
 	// it (the entry's actual stream target) is dropped too, rather than left
@@ -261,18 +272,89 @@ func (s *feedService) rewritePlaylist(body []byte, srcURL *url.URL) (string, err
 		}
 		out.WriteByte('\n')
 	}
-	return out.String(), scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	// strings.Clone, not out.String(): the returned string aliases the
+	// Builder's backing array, so without a copy sized to the actual output the
+	// whole grown capacity stays reachable — and a cached playlist pins it for
+	// playlistCacheTTL.
+	return strings.Clone(out.String()), nil
 }
 
-// writeStreamURI writes the /stream link that stands in for one upstream URI.
-// Explicit writes rather than fmt.Fprintf: this runs once per playlist line, and
-// a full channel list is tens of thousands of lines.
+// writeStreamURI writes the link that stands in for one upstream URI, shaped
+// like a standard Xtream stream URL — /<prefix>/<username>/<password>/<file>
+// — so IPTV clients that parse or rely on that convention (rather than
+// treating the M3U entry as an opaque URL) keep working. The username and
+// password are this feed's own configured credentials, standing exactly where
+// the upstream's stood, so a client sees a plausible stream URL while the
+// upstream host and the upstream's own credentials never appear in it.
+// handleStream reverses this to recover the upstream URL — see streamTarget.
+//
+// Only credentials the config knows about can be swapped out, which for an
+// Xtream feed is exactly the pair its upstream_url carries and repeats in
+// every stream path. An upstream that hands out paths bearing some other
+// secret would leak it, having given this proxy no way to recognize it.
+//
+// Explicit writes rather than fmt.Fprintf: this runs once per playlist line,
+// and a full channel list is tens of thousands of lines.
 func (s *feedService) writeStreamURI(out *strings.Builder, resolved *url.URL) {
+	path, query := s.hideCredentials.apply(resolved.EscapedPath(), resolved.RawQuery)
+	prefix, rest := streamURIPathParts(path, s.creds)
 	out.WriteString(s.publicBaseURL)
-	out.WriteString("/stream?u=")
-	out.WriteString(url.QueryEscape(resolved.String()))
-	out.WriteByte('&')
-	out.WriteString(s.creds)
+	out.WriteByte('/')
+	out.WriteString(prefix)
+	out.WriteByte('/')
+	out.WriteString(s.creds.Username)
+	out.WriteByte('/')
+	out.WriteString(s.creds.Password)
+	out.WriteByte('/')
+	out.WriteString(rest)
+	if query != "" {
+		out.WriteByte('?')
+		out.WriteString(query)
+	}
+}
+
+// fallbackStreamPrefix is the prefix used for an upstream path that is not
+// shaped like an Xtream stream URL, marking that the whole path was carried in
+// the link's trailing segments instead. streamURIPathParts never emits it as a
+// real prefix, so streamURIPath can tell the two forms apart with certainty.
+const fallbackStreamPrefix = "stream"
+
+// streamURIPathParts splits a credential-swapped upstream path — this feed's
+// username/password already standing where the upstream's did — into the
+// prefix and trailing segments of the link writeStreamURI emits. A standard
+// Xtream stream path is /<prefix>/<username>/<password>/<file...> (e.g.
+// /live/u/p/12345.ts, /series/u/p/3/1/98765.mkv,
+// /timeshift/u/p/60/2024-01-01:00-00/12345.ts); when the path has that shape
+// the prefix and the segments after the credentials are reused verbatim, so
+// the link is indistinguishable in structure from a real Xtream one and
+// streamURIPath can put the credentials back where they came from. Every other
+// shape — a path with the credentials elsewhere or not at all — falls back to
+// carrying the whole path after the credentials instead.
+func streamURIPathParts(path string, creds Credentials) (prefix, rest string) {
+	trimmed := strings.Trim(path, "/")
+	// SplitN(..., 4) caps the allocation and leaves anything past the 3rd
+	// slash as one unsplit segment, so no strings.Join is needed to rebuild it.
+	segments := strings.SplitN(trimmed, "/", 4)
+	if len(segments) < 3 || segments[0] == fallbackStreamPrefix || segments[1] != creds.Username || segments[2] != creds.Password {
+		return fallbackStreamPrefix, trimmed
+	}
+	if len(segments) == 4 {
+		rest = segments[3]
+	}
+	return segments[0], rest
+}
+
+// streamURIPath rejoins what streamURIPathParts split, returning the upstream
+// path with this feed's credentials still standing in for the upstream's (see
+// streamTarget, which swaps them back).
+func streamURIPath(prefix string, creds Credentials, rest string) string {
+	if prefix == fallbackStreamPrefix {
+		return "/" + rest
+	}
+	return "/" + prefix + "/" + creds.Username + "/" + creds.Password + "/" + rest
 }
 
 // attrURIPattern matches one quoted URI= attribute on an #EXT-X-KEY /
@@ -310,35 +392,60 @@ func (s *feedService) rewriteAttrURI(line string, base *url.URL) string {
 // own client disconnects must not cancel the fetch for the followers sharing
 // its result.
 func (s *feedService) fetchPlaylist(reqHeader http.Header) (playlistFetchResult, error) {
-	target := s.playlistTarget()
 	tctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
-	resp, err := s.repo.fetchWithRetry(tctx, target.String(), reqHeader)
+	resp, err := s.repo.fetchWithRetry(tctx, s.target.String(), reqHeader)
 	if err != nil {
-		s.logger.Error("upstream fetch failed", "error", redactErr(err))
-		s.metrics.recordUpstreamError(errorKindFetchFailed)
-		return playlistFetchResult{}, &playlistFetchError{status: http.StatusBadGateway, msg: "upstream fetch failed"}
+		return playlistFetchResult{}, s.upstreamFailure(tctx, s.target, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		s.logger.Warn("upstream returned error status", "status", resp.StatusCode, "target", redact(target.String()))
-		s.metrics.recordUpstreamError(errorKindHTTPError)
-		return playlistFetchResult{}, &playlistFetchError{status: resp.StatusCode, msg: fmt.Sprintf("upstream returned %d", resp.StatusCode)}
+	if pfErr := s.upstreamStatusFailure(tctx, s.target, resp); pfErr != nil {
+		return playlistFetchResult{}, pfErr
 	}
+	return s.readAndRewrite(tctx, resp.Body, s.target, resp.StatusCode, resp.ContentLength)
+}
 
-	body, err := io.ReadAll(resp.Body)
+// upstreamFailure logs a failed upstream fetch, counts it, and returns the
+// error the caller should report it as. err wraps the full upstream URL,
+// Xtream credentials included, so it is logged (redacted) rather than returned
+// to the client.
+func (s *feedService) upstreamFailure(ctx context.Context, target *url.URL, err error) *playlistFetchError {
+	loggerFromContext(ctx, s.logger).ErrorContext(ctx, "upstream fetch failed", "error", redactErr(err))
+	s.metrics.recordUpstreamError(errorKindFetchFailed)
+	return &playlistFetchError{status: http.StatusBadGateway, msg: "upstream fetch failed"}
+}
+
+// upstreamStatusFailure reports an upstream 4xx/5xx, or nil if the response is
+// one to serve. An expired subscription or an exhausted retry budget arrives
+// as an error body; forwarding the status keeps the player from treating a
+// rewritten error page as a valid, empty playlist.
+func (s *feedService) upstreamStatusFailure(ctx context.Context, target *url.URL, resp *http.Response) *playlistFetchError {
+	if resp.StatusCode < 400 {
+		return nil
+	}
+	loggerFromContext(ctx, s.logger).WarnContext(ctx, "upstream returned error status",
+		"status", resp.StatusCode, "target", redact(target.String()))
+	s.metrics.recordUpstreamError(errorKindHTTPError)
+	return &playlistFetchError{status: resp.StatusCode, msg: fmt.Sprintf("upstream returned %d", resp.StatusCode)}
+}
+
+// readAndRewrite turns an upstream playlist body into the result to serve. It
+// is the one place that decides how a read or rewrite failure is reported, so
+// the top-level playlist and a sub-playlist reached through /stream — which
+// are the same operation — can't drift apart.
+func (s *feedService) readAndRewrite(ctx context.Context, body io.Reader, target *url.URL, status int, sizeHint int64) (playlistFetchResult, error) {
+	logger := loggerFromContext(ctx, s.logger)
+	rewritten, err := s.rewritePlaylist(body, target, sizeHint)
 	if err != nil {
-		s.logger.Error("playlist read failed", "error", redactErr(err))
+		// Scanning is the only thing that can fail here, and it fails only on
+		// a bad read of the upstream body — hence 502 rather than a 500 for a
+		// rewrite this proxy got wrong.
+		logger.ErrorContext(ctx, "playlist read failed", "error", redactErr(err))
 		return playlistFetchResult{}, &playlistFetchError{status: http.StatusBadGateway, msg: "read failed"}
 	}
-	rewritten, err := s.rewritePlaylist(body, target)
-	if err != nil {
-		s.logger.Error("playlist rewrite failed", "error", err)
-		return playlistFetchResult{}, &playlistFetchError{status: http.StatusInternalServerError, msg: "rewrite failed"}
-	}
-	return playlistFetchResult{body: rewritten, status: resp.StatusCode}, nil
+	return playlistFetchResult{body: rewritten, status: status}, nil
 }
 
 // cachedPlaylist returns the last successfully fetched playlist if it is
@@ -346,10 +453,10 @@ func (s *feedService) fetchPlaylist(reqHeader http.Header) (playlistFetchResult,
 func (s *feedService) cachedPlaylist() (playlistFetchResult, bool) {
 	s.playlistCacheMu.Lock()
 	defer s.playlistCacheMu.Unlock()
-	if s.playlistCache == nil || time.Since(s.playlistCachedAt) > playlistCacheTTL {
+	if s.playlistCachedAt.IsZero() || time.Since(s.playlistCachedAt) > playlistCacheTTL {
 		return playlistFetchResult{}, false
 	}
-	return *s.playlistCache, true
+	return s.playlistCache, true
 }
 
 // storePlaylistCache records the result of a successful upstream fetch for
@@ -357,8 +464,21 @@ func (s *feedService) cachedPlaylist() (playlistFetchResult, bool) {
 func (s *feedService) storePlaylistCache(result playlistFetchResult) {
 	s.playlistCacheMu.Lock()
 	defer s.playlistCacheMu.Unlock()
-	s.playlistCache = &result
+	s.playlistCache = result
 	s.playlistCachedAt = time.Now()
+}
+
+// writeUpstreamError reports a failed upstream request with the status the
+// failure carries, falling back to 502 for an error from somewhere other than
+// the fetch pipeline. Shared by the playlist and stream routes so an upstream
+// failure reads the same whichever one hit it.
+func writeUpstreamError(w http.ResponseWriter, err error) {
+	status, msg := http.StatusBadGateway, "upstream fetch failed"
+	var pfErr *playlistFetchError
+	if errors.As(err, &pfErr) {
+		status, msg = pfErr.status, pfErr.msg
+	}
+	http.Error(w, msg, status)
 }
 
 // writePlaylistResponse writes a fetched (or cached) playlist result to w.
@@ -390,13 +510,7 @@ func (s *feedService) servePlaylist(reqCtx context.Context, w http.ResponseWrite
 	logger.InfoContext(reqCtx, "playlist fetch", "cached", false, "coalesced", shared)
 
 	if err != nil {
-		status := http.StatusBadGateway
-		msg := "upstream fetch failed"
-		var pfErr *playlistFetchError
-		if errors.As(err, &pfErr) {
-			status, msg = pfErr.status, pfErr.msg
-		}
-		http.Error(w, msg, status)
+		writeUpstreamError(w, err)
 		return
 	}
 
@@ -422,22 +536,13 @@ func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHe
 			logger.InfoContext(reqCtx, "stream request canceled: client disconnected")
 			return
 		}
-		// err wraps the full upstream URL, Xtream credentials included, so it
-		// is logged (redacted) rather than returned to the client.
-		logger.ErrorContext(reqCtx, "upstream fetch failed", "error", redactErr(err))
-		s.metrics.recordUpstreamError(errorKindFetchFailed)
-		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
+		writeUpstreamError(w, s.upstreamFailure(reqCtx, target, err))
 		return
 	}
 	defer resp.Body.Close()
 
-	// An expired subscription or an exhausted retry budget arrives as a 4xx/5xx
-	// body. Forwarding the status keeps the player from treating a rewritten
-	// error page as a valid, empty playlist.
-	if resp.StatusCode >= 400 {
-		logger.WarnContext(reqCtx, "upstream returned error status", "status", resp.StatusCode, "target", redact(target.String()))
-		s.metrics.recordUpstreamError(errorKindHTTPError)
-		http.Error(w, fmt.Sprintf("upstream returned %d", resp.StatusCode), resp.StatusCode)
+	if pfErr := s.upstreamStatusFailure(reqCtx, target, resp); pfErr != nil {
+		writeUpstreamError(w, pfErr)
 		return
 	}
 
@@ -446,22 +551,12 @@ func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHe
 	peeked, _ := buf.Peek(512)
 
 	if shouldRewritePlaylist(target, contentType, peeked) {
-		body, err := io.ReadAll(buf)
+		result, err := s.readAndRewrite(reqCtx, buf, target, resp.StatusCode, resp.ContentLength)
 		if err != nil {
-			logger.ErrorContext(reqCtx, "playlist read failed", "error", redactErr(err))
-			http.Error(w, "read failed", http.StatusBadGateway)
+			writeUpstreamError(w, err)
 			return
 		}
-		rewritten, err := s.rewritePlaylist(body, target)
-		if err != nil {
-			logger.ErrorContext(reqCtx, "playlist rewrite failed", "error", err)
-			http.Error(w, "rewrite failed", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(resp.StatusCode)
-		io.WriteString(w, rewritten)
+		writePlaylistResponse(w, result)
 		return
 	}
 

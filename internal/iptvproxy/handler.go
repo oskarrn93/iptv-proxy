@@ -1,8 +1,6 @@
 package iptvproxy
 
 import (
-	"crypto/subtle"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,23 +10,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// feed is one configured feed's runtime pieces: the credentials a client
-// authenticates with, and the service that knows how to serve it.
-type feed struct {
-	name     string
-	username string
-	password string
-	svc      *feedService
-	metrics  *feedMetrics
-}
-
 // Proxy is the single HTTP entry point for every configured feed. All feeds
 // share one listen address; a request's username/password (query params or
 // HTTP Basic Auth) is matched against every feed's own credentials to pick
 // which one's upstream serves it, so exposing several upstream IPTV accounts
 // no longer means exposing one port each.
 type Proxy struct {
-	feeds          []*feed
+	feeds          []*feedService
 	logger         *slog.Logger
 	metricsHandler http.Handler
 }
@@ -51,13 +39,7 @@ func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, er
 		if err != nil {
 			return nil, fmt.Errorf("feed %q: %w", feedCfg.Name, err)
 		}
-		p.feeds = append(p.feeds, &feed{
-			name:     feedCfg.Name,
-			username: feedCfg.Username,
-			password: feedCfg.Password,
-			svc:      svc,
-			metrics:  metrics,
-		})
+		p.feeds = append(p.feeds, svc)
 	}
 
 	if len(gatherers) == 0 {
@@ -75,7 +57,7 @@ func (p *Proxy) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/playlist.m3u8", p.withRequestLogger(p.handlePlaylist))
 	mux.HandleFunc("/", p.withRequestLogger(p.handlePlaylist))
-	mux.HandleFunc("/stream", p.withRequestLogger(p.handleStream))
+	mux.HandleFunc("/{prefix}/{username}/{password}/{rest...}", p.withRequestLogger(p.handleStream))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, max-age=0")
 		w.WriteHeader(http.StatusOK)
@@ -98,15 +80,24 @@ func (r *statusRecorder) WriteHeader(status int) {
 	r.ResponseWriter.WriteHeader(status)
 }
 
+// Unwrap exposes the wrapped writer to http.ResponseController. Without it a
+// controller can reach neither this recorder's Flush (embedding the
+// http.ResponseWriter *interface* promotes only Header/Write/WriteHeader) nor
+// the real writer's, so bufferedCopy's flush would silently no-op and a live
+// TS relay would deliver nothing until a buffer filled.
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
 // instrument runs next, then records the outcome against the matched feed's
 // own metrics under the given route label. Which feed that is isn't known
 // until authentication resolves it, so — unlike the old per-feed handler —
 // this is called per request rather than wrapped once at Mux() build time.
-func (f *feed) instrument(r route, w http.ResponseWriter, req *http.Request, next func(w http.ResponseWriter, req *http.Request)) {
+func (s *feedService) instrument(r route, w http.ResponseWriter, next func(w http.ResponseWriter)) {
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	start := time.Now()
-	next(rec, req)
-	f.metrics.observeRequest(r, rec.status, time.Since(start))
+	next(rec)
+	s.metrics.observeRequest(r, rec.status, time.Since(start))
 }
 
 // withRequestLogger stamps every request with its own request_id and attaches
@@ -120,39 +111,63 @@ func (p *Proxy) withRequestLogger(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// authenticate accepts either ?username=&password= query params or HTTP
-// Basic Auth (so both "M3U URL" and "Xtream login" style IPTV apps work),
-// and matches them against every configured feed to pick which one serves
-// this request. A username that matches a known feed but the wrong password
-// counts an auth failure against that feed's own metrics; a username
-// matching no feed at all is logged but not attributed to any feed.
-func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) *feed {
-	user := r.URL.Query().Get("username")
-	pass := r.URL.Query().Get("password")
-	if user == "" && pass == "" {
-		if basicUser, basicPass, ok := r.BasicAuth(); ok {
-			user, pass = basicUser, basicPass
-		}
-	}
-
-	var candidate *feed
+// matchFeed finds the feed whose own credentials are exactly creds. candidate
+// is the feed whose username matched but whose password did not, so a failure
+// can still be attributed to the right feed's metrics. A linear scan is fine:
+// it runs once per request (not per playlist line), over a handful of feeds.
+func (p *Proxy) matchFeed(creds Credentials) (matched, candidate *feedService) {
 	for _, f := range p.feeds {
-		if subtle.ConstantTimeCompare([]byte(user), []byte(f.username)) != 1 {
+		userOK, passOK := f.matches(creds)
+		if !userOK {
 			continue
 		}
 		candidate = f
-		if subtle.ConstantTimeCompare([]byte(pass), []byte(f.password)) == 1 {
-			return f
+		if passOK {
+			return f, nil
 		}
 	}
+	return nil, candidate
+}
 
-	loggerFromContext(r.Context(), p.logger).WarnContext(r.Context(), "auth failed",
-		"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+// rejectUnauthorized is the single response to a request whose credentials
+// match no feed: one log line, one metric, one 401 — so the playlist and
+// stream routes can't drift into reporting a rejection differently.
+func (p *Proxy) rejectUnauthorized(w http.ResponseWriter, r *http.Request, candidate *feedService) {
+	logger := loggerFromContext(r.Context(), p.logger)
 	if candidate != nil {
 		candidate.metrics.authFailures.Inc()
+		logger = logger.With("feed", candidate.name)
 	}
+	logger.WarnContext(r.Context(), "auth failed",
+		"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
-	return nil
+}
+
+// requestCredentials reads the credentials a request presents, accepting
+// either ?username=&password= query params or HTTP Basic Auth so both "M3U
+// URL" and "Xtream login" style IPTV apps work.
+func requestCredentials(r *http.Request) Credentials {
+	query := r.URL.Query()
+	creds := Credentials{Username: query.Get("username"), Password: query.Get("password")}
+	if creds.Username == "" && creds.Password == "" {
+		if user, pass, ok := r.BasicAuth(); ok {
+			creds = Credentials{Username: user, Password: pass}
+		}
+	}
+	return creds
+}
+
+// authenticate matches a request's credentials against every configured feed
+// to pick which one serves it. A username that matches a known feed but the
+// wrong password counts an auth failure against that feed's own metrics; a
+// username matching no feed at all is logged but not attributed to any feed.
+func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) *feedService {
+	f, candidate := p.matchFeed(requestCredentials(r))
+	if f == nil {
+		p.rejectUnauthorized(w, r, candidate)
+		return nil
+	}
+	return f
 }
 
 // handlePlaylist serves the matched feed's own top-level playlist (its
@@ -163,35 +178,33 @@ func (p *Proxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	if f == nil {
 		return
 	}
-	f.instrument(routePlaylist, w, r, func(w http.ResponseWriter, r *http.Request) {
-		loggerFromContext(r.Context(), f.svc.logger).InfoContext(r.Context(), "playlist request",
+	f.instrument(routePlaylist, w, func(w http.ResponseWriter) {
+		loggerFromContext(r.Context(), f.logger).InfoContext(r.Context(), "playlist request",
 			"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
-		f.svc.servePlaylist(r.Context(), w, r.Header)
+		f.servePlaylist(r.Context(), w, r.Header)
 	})
 }
 
 // handleStream serves rewritten segment/sub-playlist links produced by
-// rewritePlaylist, fetching whatever upstream URL is given in "u" through the
-// matched feed.
+// rewritePlaylist. Its username/password are the matched feed's own
+// credentials, written into the link where the upstream's own credentials
+// stood (see writeStreamURI) — so they both say which feed the link belongs to
+// and authenticate it, exactly as they do on the playlist route. They arrive
+// as path segments, /<prefix>/<username>/<password>/<file>, mimicking a
+// standard Xtream stream URL; the feed's configured upstream is what turns the
+// rest back into a URL to fetch (see streamTarget).
 func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request) {
-	f := p.authenticate(w, r)
+	f, candidate := p.matchFeed(Credentials{
+		Username: r.PathValue("username"),
+		Password: r.PathValue("password"),
+	})
 	if f == nil {
+		p.rejectUnauthorized(w, r, candidate)
 		return
 	}
-	f.instrument(routeStream, w, r, func(w http.ResponseWriter, r *http.Request) {
-		streamReq, err := f.svc.parseStreamRequest(r.Context(), r.URL.Query().Get("u"))
-		if err != nil {
-			var reqErr *StreamRequestError
-			if errors.As(err, &reqErr) && reqErr.Forbidden {
-				loggerFromContext(r.Context(), f.svc.logger).WarnContext(r.Context(), "rejected stream target",
-					"remote_addr", r.RemoteAddr, "error", err)
-				http.Error(w, "forbidden target", http.StatusForbidden)
-				return
-			}
-			http.Error(w, "bad u param", http.StatusBadRequest)
-			return
-		}
 
-		f.svc.serve(r.Context(), w, r.Header, streamReq.Target)
+	target := f.streamTarget(r.PathValue("prefix"), r.PathValue("rest"), r.URL.RawQuery)
+	f.instrument(routeStream, w, func(w http.ResponseWriter) {
+		f.serve(r.Context(), w, r.Header, target)
 	})
 }

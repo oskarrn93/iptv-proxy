@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-playground/validator/v10"
@@ -17,15 +19,19 @@ import (
 // username/password (not this process's listen port) is what picks which
 // feed's upstream serves it — see Proxy.authenticate.
 type Config struct {
-	ListenAddr string       `yaml:"listen_addr" validate:"required"`
-	Feeds      []FeedConfig `yaml:"feeds" validate:"min=1,unique=Username,dive"`
+	ListenAddr string `yaml:"listen_addr" validate:"required"`
+	// unique=Username names the Go field promoted from the embedded
+	// Credentials, which is what tells two feeds apart on the shared port.
+	Feeds []FeedConfig `yaml:"feeds" validate:"min=1,unique=Username,dive"`
 }
 
 type FeedConfig struct {
-	Name        string        `yaml:"name" validate:"required"`
-	UpstreamURL string        `yaml:"upstream_url" validate:"required,http_url"`
-	Username    string        `yaml:"username" validate:"required"`
-	Password    string        `yaml:"password" validate:"required"`
+	Name        string `yaml:"name" validate:"required"`
+	UpstreamURL string `yaml:"upstream_url" validate:"required,http_url"`
+	// Credentials is embedded inline, so a feed still spells its own pair as
+	// plain `username:`/`password:` keys — it is one value only so that the
+	// two can't be passed around, matched, or rewritten separately.
+	Credentials `yaml:",inline"`
 	Timeout     time.Duration `yaml:"timeout"`
 	// PublicBaseURL, when set, is prepended to every rewritten /stream link
 	// (e.g. "http://server.example.com:58034") so the served playlist's
@@ -43,21 +49,25 @@ type FeedConfig struct {
 	ExcludeGroupPrefixes []string `yaml:"exclude_group_prefixes"`
 }
 
-var validate = validator.New(validator.WithRequiredStructEnabled())
-
-// feedYAMLKey maps a FeedConfig struct field name to its config.yaml key, so
-// validation errors read in terms of the file the operator actually edited.
-var feedYAMLKey = map[string]string{
-	"Name":          "name",
-	"UpstreamURL":   "upstream_url",
-	"Username":      "username",
-	"Password":      "password",
-	"PublicBaseURL": "public_base_url",
-}
+// validate reports failures in terms of config.yaml's own keys rather than Go
+// field names: registering the yaml tag as the field name means a new field
+// needs no second registration anywhere to get a message an operator can act
+// on.
+var validate = func() *validator.Validate {
+	v := validator.New(validator.WithRequiredStructEnabled())
+	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
+		name, _, _ := strings.Cut(fld.Tag.Get("yaml"), ",")
+		if name == "-" {
+			return ""
+		}
+		return name
+	})
+	return v
+}()
 
 // feedIndexPattern extracts the slice index from a validator namespace like
-// "Config.Feeds[2].UpstreamURL".
-var feedIndexPattern = regexp.MustCompile(`Feeds\[(\d+)\]`)
+// "Config.feeds[2].upstream_url".
+var feedIndexPattern = regexp.MustCompile(`feeds\[(\d+)\]`)
 
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -99,20 +109,30 @@ func describeValidationError(cfg *Config, err error) error {
 		if idx < len(cfg.Feeds) && cfg.Feeds[idx].Name != "" {
 			feedRef = fmt.Sprintf("feed %q", cfg.Feeds[idx].Name)
 		}
-		key := feedYAMLKey[fe.Field()]
-
-		switch fe.Tag() {
-		case "http_url":
-			return fmt.Errorf("%s: %s must be an absolute http:// or https:// URL", feedRef, key)
-		default:
-			return fmt.Errorf("%s: %s is required", feedRef, key)
-		}
+		return fmt.Errorf("%s: %s", feedRef, describeFieldError(fe))
 	}
 
+	return errors.New(describeFieldError(fe))
+}
+
+// describeFieldError phrases one validator failure against the config.yaml key
+// it concerns. The default names the key and the rule it broke rather than
+// asserting a specific cause, so a field added later can't inherit a message
+// about some unrelated rule.
+func describeFieldError(fe validator.FieldError) string {
 	switch fe.Tag() {
+	case "required":
+		return fmt.Sprintf("%s is required", fe.Field())
+	case "http_url":
+		return fmt.Sprintf("%s must be an absolute http:// or https:// URL", fe.Field())
+	case "min":
+		// The only "min" rule is feeds having at least one entry.
+		return "config has no feeds defined"
 	case "unique":
-		return fmt.Errorf("duplicate %s across feeds", feedYAMLKey[fe.Param()])
-	default: // "min": Feeds is empty
-		return errors.New("config has no feeds defined")
+		// fe.Param() is the tag's literal argument (a Go field name), not a
+		// yaml key, so it can't be reported directly.
+		return "duplicate username across feeds"
+	default:
+		return fmt.Sprintf("%s is invalid (failed %q)", fe.Field(), fe.Tag())
 	}
 }

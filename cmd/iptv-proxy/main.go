@@ -23,7 +23,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"sync"
 	"syscall"
 	"time"
 
@@ -75,11 +74,11 @@ func run() int {
 		IdleTimeout:  120 * time.Second,
 	}
 
+	// Buffered so the goroutine's send never blocks, whether or not anyone is
+	// still selecting on it. srv.Shutdown below is what actually waits for
+	// in-flight connections to drain.
 	serveErrs := make(chan error, 1)
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		logger.Info("listening", "addr", srv.Addr, "feeds", len(cfg.Feeds))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErrs <- err
@@ -103,7 +102,5 @@ func run() int {
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Error("shutdown error", "error", err)
 	}
-
-	wg.Wait()
 	return exitCode
 }
