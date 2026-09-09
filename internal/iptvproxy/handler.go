@@ -57,6 +57,7 @@ func (p *Proxy) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/playlist.m3u8", p.withRequestLogger(p.handlePlaylist))
 	mux.HandleFunc("/", p.withRequestLogger(p.handlePlaylist))
+	mux.HandleFunc("/epg", p.withRequestLogger(p.handleEPG))
 	mux.HandleFunc("/{prefix}/{username}/{password}/{rest...}", p.withRequestLogger(p.handleStream))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, max-age=0")
@@ -182,6 +183,22 @@ func (p *Proxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 		loggerFromContext(r.Context(), f.logger).InfoContext(r.Context(), "playlist request",
 			"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
 		f.servePlaylist(r.Context(), w, r.Header, requestBaseURL(r))
+	})
+}
+
+// handleEPG serves the matched feed's own XMLTV guide, fetched from its
+// upstream's /xmltv.php (see feedService.epgTarget) and cached — same
+// credential resolution as handlePlaylist, so an IPTV app can point its EPG
+// URL at this proxy with the same feed credentials it uses for the playlist.
+func (p *Proxy) handleEPG(w http.ResponseWriter, r *http.Request) {
+	f := p.authenticate(w, r)
+	if f == nil {
+		return
+	}
+	f.instrument(routeEPG, w, func(w http.ResponseWriter) {
+		loggerFromContext(r.Context(), f.logger).InfoContext(r.Context(), "epg request",
+			"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+		f.serveEPG(r.Context(), w)
 	})
 }
 

@@ -32,6 +32,17 @@ const playlistGroupKey = "playlist"
 // per poll" to "once per TTL" per feed.
 const playlistCacheTTL = 3 * time.Hour
 
+// epgGroupKey is the singleflight.Group key for a feed's EPG fetch, mirroring
+// playlistGroupKey: a feedService has exactly one EPG target (its upstream's
+// xmltv.php), so every call coalesces under this one constant key.
+const epgGroupKey = "epg"
+
+// epgCacheTTL is how long a fetched XMLTV guide is served from memory before
+// the next request triggers a fresh upstream fetch. An EPG guide is tens of
+// megabytes and changes far less often than a channel list, so this is much
+// longer than playlistCacheTTL.
+const epgCacheTTL = 12 * time.Hour
+
 // maxPlaylistGrow caps the up-front allocation rewritePlaylist sizes from the
 // upstream's Content-Length.
 const maxPlaylistGrow = 8 << 20
@@ -60,10 +71,15 @@ type feedService struct {
 	// creds are this feed's own configured credentials, written into every
 	// rewritten link (see writeStreamURI) and matched against an incoming
 	// /stream request to find the feed again.
-	creds   Credentials
-	repo    *upstreamRepository
-	logger  *slog.Logger
-	metrics *feedMetrics
+	creds Credentials
+	// upstreamCreds are the credentials this feed's own upstream_url embeds
+	// (zero if it embeds none), used to build the EPG target (see epgTarget)
+	// — the one place besides hideCredentials/restoreCredentials that needs
+	// the upstream's own pair rather than this feed's.
+	upstreamCreds Credentials
+	repo          *upstreamRepository
+	logger        *slog.Logger
+	metrics       *feedMetrics
 	// playlistGroup coalesces concurrent requests for this feed's playlist
 	// into a single upstream fetch — a channel list can be tens of megabytes,
 	// and IPTV apps routinely poll it every few seconds from multiple
@@ -77,6 +93,13 @@ type feedService struct {
 	playlistCacheMu  sync.Mutex
 	playlistCache    playlistFetchResult
 	playlistCachedAt time.Time
+	// epgGroup/epgCacheMu/epgCache/epgCachedAt mirror the playlist fields
+	// above for the EPG route, coalescing concurrent fetches of the same
+	// multi-megabyte XMLTV guide and caching the result for epgCacheTTL.
+	epgGroup    singleflight.Group
+	epgCacheMu  sync.Mutex
+	epgCache    epgFetchResult
+	epgCachedAt time.Time
 }
 
 // playlistFetchResult is the outcome of one upstream playlist fetch, shared
@@ -95,6 +118,17 @@ type playlistFetchError struct {
 }
 
 func (e *playlistFetchError) Error() string { return e.msg }
+
+// epgFetchResult is the outcome of one upstream XMLTV fetch, shared verbatim
+// across every request coalesced onto it by epgGroup. Unlike a playlist, an
+// EPG body is opaque to this proxy — nothing in it needs rewriting, since an
+// XMLTV guide carries channel ids/titles, not upstream stream URLs — so it is
+// cached and served as-is, with only its upstream Content-Type carried along.
+type epgFetchResult struct {
+	body        []byte
+	status      int
+	contentType string
+}
 
 func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logger, metrics *feedMetrics) (*feedService, error) {
 	target, err := url.Parse(cfg.UpstreamURL)
@@ -145,6 +179,7 @@ func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logge
 		hideCredentials:      hide,
 		restoreCredentials:   hide.reversed(),
 		creds:                cfg.Credentials,
+		upstreamCreds:        upstreamCreds,
 		repo:                 repo,
 		logger:               logger,
 		metrics:              metrics,
@@ -167,6 +202,21 @@ func (s *feedService) matches(creds Credentials) (userOK, passOK bool) {
 func (s *feedService) streamTarget(prefix, rest, rawQuery string) *url.URL {
 	path, query := s.restoreCredentials.apply(streamURIPath(prefix, s.creds, rest), rawQuery)
 	return &url.URL{Scheme: s.target.Scheme, Host: s.target.Host, Path: path, RawQuery: query}
+}
+
+// epgTarget is this feed's upstream XMLTV guide URL: the same scheme/host as
+// its configured upstream_url (never anything a client supplies, same
+// reasoning as streamTarget), with the standard Xtream /xmltv.php path and
+// this feed's own upstream credentials as query params. A feed whose
+// upstream_url embeds no credentials (upstreamCreds is zero) hits xmltv.php
+// with no query at all, which is what an upstream with no such scheme expects.
+func (s *feedService) epgTarget() *url.URL {
+	target := &url.URL{Scheme: s.target.Scheme, Host: s.target.Host, Path: "/xmltv.php"}
+	if s.upstreamCreds.Username != "" || s.upstreamCreds.Password != "" {
+		q := url.Values{"username": {s.upstreamCreds.Username}, "password": {s.upstreamCreds.Password}}
+		target.RawQuery = q.Encode()
+	}
+	return target
 }
 
 // upstreamContext gives finite responses a deadline and leaves live TS streams
@@ -533,6 +583,98 @@ func (s *feedService) storePlaylistCache(result playlistFetchResult) {
 	defer s.playlistCacheMu.Unlock()
 	s.playlistCache = result
 	s.playlistCachedAt = time.Now()
+}
+
+// fetchEPG fetches this feed's XMLTV guide from upstream. Only ever called
+// from inside epgGroup.Do, for the same reason fetchPlaylist is: its result is
+// shared across every request coalesced onto the same call, so it fetches
+// with a context detached from any single caller rather than the request that
+// happened to trigger it.
+func (s *feedService) fetchEPG() (epgFetchResult, error) {
+	tctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+
+	target := s.epgTarget()
+	resp, err := s.repo.fetchWithRetry(tctx, target.String(), nil)
+	if err != nil {
+		return epgFetchResult{}, s.upstreamFailure(tctx, target, err)
+	}
+	defer resp.Body.Close()
+
+	if pfErr := s.upstreamStatusFailure(tctx, target, resp); pfErr != nil {
+		return epgFetchResult{}, pfErr
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		loggerFromContext(tctx, s.logger).ErrorContext(tctx, "epg read failed", "error", redactErr(err))
+		return epgFetchResult{}, &playlistFetchError{status: http.StatusBadGateway, msg: "read failed"}
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/xml"
+	}
+	return epgFetchResult{body: body, status: resp.StatusCode, contentType: contentType}, nil
+}
+
+// cachedEPG returns the last successfully fetched EPG guide if it is still
+// within epgCacheTTL.
+func (s *feedService) cachedEPG() (epgFetchResult, bool) {
+	s.epgCacheMu.Lock()
+	defer s.epgCacheMu.Unlock()
+	if s.epgCachedAt.IsZero() || time.Since(s.epgCachedAt) > epgCacheTTL {
+		return epgFetchResult{}, false
+	}
+	return s.epgCache, true
+}
+
+// storeEPGCache records the result of a successful upstream fetch for
+// cachedEPG to serve until it ages out.
+func (s *feedService) storeEPGCache(result epgFetchResult) {
+	s.epgCacheMu.Lock()
+	defer s.epgCacheMu.Unlock()
+	s.epgCache = result
+	s.epgCachedAt = time.Now()
+}
+
+// writeEPGResponse writes a fetched (or cached) EPG result to w verbatim — an
+// XMLTV guide carries no upstream URLs, so unlike a playlist it needs no
+// per-request host substitution.
+func writeEPGResponse(w http.ResponseWriter, result epgFetchResult) {
+	w.Header().Set("Content-Type", result.contentType)
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(result.status)
+	_, _ = w.Write(result.body)
+}
+
+// serveEPG serves this feed's XMLTV guide, following the same
+// cache-then-coalesce shape as servePlaylist: a request within epgCacheTTL of
+// the last successful upstream fetch is served straight from that cache;
+// otherwise it coalesces onto a single upstream fetch via epgGroup, shared
+// with any other request racing it for the same refresh.
+func (s *feedService) serveEPG(reqCtx context.Context, w http.ResponseWriter) {
+	logger := loggerFromContext(reqCtx, s.logger)
+
+	if result, ok := s.cachedEPG(); ok {
+		logger.InfoContext(reqCtx, "epg fetch", "cached", true)
+		writeEPGResponse(w, result)
+		return
+	}
+
+	v, err, shared := s.epgGroup.Do(epgGroupKey, func() (any, error) {
+		return s.fetchEPG()
+	})
+	logger.InfoContext(reqCtx, "epg fetch", "cached", false, "coalesced", shared)
+
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+
+	result := v.(epgFetchResult)
+	s.storeEPGCache(result)
+	writeEPGResponse(w, result)
 }
 
 // writeUpstreamError reports a failed upstream request with the status the

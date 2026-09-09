@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -279,6 +280,78 @@ func TestHandlePlaylist_ForwardsUpstreamErrorStatus(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/playlist.m3u8?username=alice&password=secret", nil)
 	rec := httptest.NewRecorder()
 	p.handlePlaylist(rec, req)
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// TestHandleEPG_RequiresAuthAndFetchesXMLTV checks handleEPG rejects an
+// unauthenticated request the same way handlePlaylist does, and that an
+// authenticated one reaches the upstream's /xmltv.php with the upstream's own
+// (not the client-facing) credentials — the same swap streamTarget performs.
+func TestHandleEPG_RequiresAuthAndFetchesXMLTV(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/xmltv.php", r.URL.Path)
+		assert.Equal(t, "xtreamuser", r.URL.Query().Get("username"))
+		assert.Equal(t, "xtreampass", r.URL.Query().Get("password"))
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte("<tv></tv>"))
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream.URL+"/get.php?username=xtreamuser&password=xtreampass")
+
+	t.Run("unauthorized without creds", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/epg", nil)
+		rec := httptest.NewRecorder()
+		p.handleEPG(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("authorized request fetches upstream xmltv.php", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/epg?username=alice&password=secret", nil)
+		rec := httptest.NewRecorder()
+		p.handleEPG(rec, req)
+
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, "<tv></tv>", rec.Body.String())
+		assert.Equal(t, "application/xml", rec.Header().Get("Content-Type"))
+	})
+}
+
+// TestHandleEPG_Caches pins that a second request within epgCacheTTL is
+// served from cache rather than triggering a second upstream fetch, mirroring
+// TestHandlePlaylist_BaseURLPerRequestHost's cache assertion for the playlist
+// route.
+func TestHandleEPG_Caches(t *testing.T) {
+	var hits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("<tv></tv>"))
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream.URL+"/get.php")
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/epg?username=alice&password=secret", nil)
+		rec := httptest.NewRecorder()
+		p.handleEPG(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code)
+	}
+
+	assert.Equal(t, int64(1), hits.Load(), "second request must be served from cache, not refetched")
+}
+
+func TestHandleEPG_ForwardsUpstreamErrorStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream.URL+"/get.php")
+	req := httptest.NewRequest(http.MethodGet, "/epg?username=alice&password=secret", nil)
+	rec := httptest.NewRecorder()
+	p.handleEPG(rec, req)
 
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }

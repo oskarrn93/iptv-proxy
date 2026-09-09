@@ -17,6 +17,7 @@ type route string
 const (
 	routePlaylist route = "playlist"
 	routeStream   route = "stream"
+	routeEPG      route = "epg"
 )
 
 // errorKind identifies why an upstream request failed, used as the "kind"

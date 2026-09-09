@@ -147,6 +147,24 @@ func TestNewFeedService_ValidUpstreamURL(t *testing.T) {
 	assert.Equal(t, "example.com", s.target.Host)
 }
 
+// TestEPGTarget covers epgTarget's two shapes: an upstream_url that embeds
+// Xtream credentials gets them carried onto /xmltv.php, since that's the
+// upstream's own scheme, not something this proxy invents; one with none gets
+// a bare /xmltv.php, matching what an upstream with no such scheme expects.
+func TestEPGTarget(t *testing.T) {
+	t.Run("carries upstream credentials", func(t *testing.T) {
+		s := newTestService(t, "http://upstream.example.com/get.php?username=xtreamuser&password=xtreampass")
+		target := s.epgTarget()
+		assert.Equal(t, "http://upstream.example.com/xmltv.php?password=xtreampass&username=xtreamuser", target.String())
+	})
+
+	t.Run("no query when upstream has no credentials", func(t *testing.T) {
+		s := newTestService(t, "http://upstream.example.com/get.php")
+		target := s.epgTarget()
+		assert.Equal(t, "http://upstream.example.com/xmltv.php", target.String())
+	})
+}
+
 // TestRewritePlaylist_BaseURLPerRequest covers auto-detecting the public host
 // from the request instead of a configured public_base_url: rewritePlaylist
 // writes baseURLPlaceholder into every link, and applyBaseURL — called once
