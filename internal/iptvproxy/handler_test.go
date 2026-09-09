@@ -235,6 +235,40 @@ func TestHandleStream_ExposesActiveSessionsByKind(t *testing.T) {
 	assert.Contains(t, body, `iptv_proxy_active_sessions{feed="test",kind="vod"} 0`)
 }
 
+// TestHandlePlaylist_BaseURLPerRequestHost is the end-to-end case this
+// whole mechanism exists for: the same feed, same cached playlist fetch,
+// serving distinct absolute /stream links to a request that reached the
+// proxy on the LAN vs. one that came in through a reverse proxy's
+// X-Forwarded-Host — with no public_base_url configured anywhere. The
+// upstream hit counter pins that the second request is served from
+// playlistCache (see servePlaylist), not a second fetch+rewrite — proving
+// the host substitution itself happens on every response, cached or not,
+// rather than being baked in once at rewrite time.
+func TestHandlePlaylist_BaseURLPerRequestHost(t *testing.T) {
+	upstream, upstreamHits := newCountingPlaylistUpstream(t)
+
+	p := newTestProxy(t, upstream.URL+"/get.php")
+
+	lanReq := httptest.NewRequest(http.MethodGet, "/playlist.m3u8?username=alice&password=secret", nil)
+	lanReq.Host = "192.168.1.12:58033"
+	lanRec := httptest.NewRecorder()
+	p.handlePlaylist(lanRec, lanReq)
+	require.Equal(t, http.StatusOK, lanRec.Code)
+	assert.Contains(t, lanRec.Body.String(), "http://192.168.1.12:58033/stream/")
+
+	extReq := httptest.NewRequest(http.MethodGet, "/playlist.m3u8?username=alice&password=secret", nil)
+	extReq.Host = "internal-host:58033"
+	extReq.Header.Set("X-Forwarded-Host", "iptv.example.com")
+	extReq.Header.Set("X-Forwarded-Proto", "https")
+	extRec := httptest.NewRecorder()
+	p.handlePlaylist(extRec, extReq)
+	require.Equal(t, http.StatusOK, extRec.Code)
+	assert.Contains(t, extRec.Body.String(), "https://iptv.example.com/stream/")
+	assert.NotContains(t, extRec.Body.String(), "internal-host")
+
+	assert.Equal(t, int64(1), upstreamHits.Load(), "second request must be served from cache, not refetched, to prove the host swap happens per response")
+}
+
 func TestHandlePlaylist_ForwardsUpstreamErrorStatus(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)

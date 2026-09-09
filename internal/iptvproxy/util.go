@@ -47,6 +47,40 @@ var forwardedRequestHeaders = []string{"Range", "If-Range", "Accept", "User-Agen
 // non-playlist bodies so ranged/seekable responses stay intact.
 var forwardedResponseHeaders = []string{"Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"}
 
+// requestBaseURL derives the scheme://host a client actually reached this
+// proxy at, from the request alone — so a rewritten playlist's links can be
+// made absolute without any configured public_base_url. X-Forwarded-Host/
+// X-Forwarded-Proto (set by a reverse proxy such as Traefik) take priority
+// over Host/TLS so a proxied request reports the address the client used,
+// not this process's own listen_addr; a request with several comma-separated
+// values in either header (multiple proxy hops) uses the first, which is the
+// one closest to the original client. This is what lets the same cached
+// playlist serve LAN and external clients alike, each seeing links back to
+// whichever host they themselves connected through.
+func requestBaseURL(r *http.Request) string {
+	host := r.Host
+	if fwd := firstForwarded(r.Header.Get("X-Forwarded-Host")); fwd != "" {
+		host = fwd
+	}
+
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if fwd := firstForwarded(r.Header.Get("X-Forwarded-Proto")); fwd != "" {
+		scheme = fwd
+	}
+
+	return scheme + "://" + host
+}
+
+// firstForwarded returns the first comma-separated value in an
+// X-Forwarded-* header, trimmed, or "" if the header was empty.
+func firstForwarded(v string) string {
+	first, _, _ := strings.Cut(v, ",")
+	return strings.TrimSpace(first)
+}
+
 // lowercaseAll lowercases each string in ss, so a case-insensitive prefix
 // list only needs its comparisons done once at config-load time rather than
 // once per playlist line.

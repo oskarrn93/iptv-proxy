@@ -147,10 +147,15 @@ func TestNewFeedService_ValidUpstreamURL(t *testing.T) {
 	assert.Equal(t, "example.com", s.target.Host)
 }
 
-func TestRewritePlaylist_PublicBaseURL(t *testing.T) {
-	cfg := testFeedConfig("http://upstream.example.com/get.php")
-	cfg.PublicBaseURL = "http://public.example.com:58034/"
-	s := newServiceFor(t, cfg)
+// TestRewritePlaylist_BaseURLPerRequest covers auto-detecting the public host
+// from the request instead of a configured public_base_url: rewritePlaylist
+// writes baseURLPlaceholder into every link, and applyBaseURL — called once
+// per response, not once per cached rewrite — substitutes in whichever host
+// a given request actually reached the proxy through. The same cached
+// rewrite this way serves distinct absolute links to a LAN client and an
+// external one.
+func TestRewritePlaylist_BaseURLPerRequest(t *testing.T) {
+	s := newTestService(t, "http://upstream.example.com/get.php")
 
 	srcURL, _ := url.Parse("http://upstream.example.com/live/index.m3u8")
 	body := []byte("#EXTM3U\n#EXTINF:10,\nsegment1.ts\n")
@@ -158,11 +163,14 @@ func TestRewritePlaylist_PublicBaseURL(t *testing.T) {
 	out, err := rewriteBody(s, body, srcURL)
 	require.NoError(t, err)
 
-	assert.Contains(t, out, "http://public.example.com:58034/stream/")
+	assert.Contains(t, out, baseURLPlaceholder+"/stream/")
 	assert.NotContains(t, out, "upstream.example.com") // raw upstream host never appears
-	targets := resolveStreamLinks(t, s, out)
-	require.Len(t, targets, 1)
-	assert.Equal(t, "http://upstream.example.com/live/segment1.ts", targets[0])
+
+	for _, host := range []string{"http://192.168.1.12:58033", "https://public.example.com"} {
+		resolved := applyBaseURL(out, host)
+		assert.Contains(t, resolved, host+"/stream/")
+		assert.NotContains(t, resolved, baseURLPlaceholder)
+	}
 }
 
 func TestRewritePlaylist(t *testing.T) {
@@ -259,7 +267,7 @@ func TestRewriteAttrURI_SingleQuotes(t *testing.T) {
 
 	line := `#EXT-X-KEY:METHOD=AES-128,URI='key.bin'`
 	out := s.rewriteAttrURI(line, base)
-	assert.Contains(t, out, "URI='/stream/")
+	assert.Contains(t, out, "URI='"+baseURLPlaceholder+"/stream/")
 	assert.NotContains(t, out, "upstream.example.com") // raw upstream host never appears
 
 	targets := resolveStreamLinks(t, s, out)
@@ -404,7 +412,7 @@ func TestServePlaylist_CachesAcrossRequests(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		w := httptest.NewRecorder()
-		s.servePlaylist(ctx, w, http.Header{})
+		s.servePlaylist(ctx, w, http.Header{}, "http://proxy.example.com")
 		assert.Equal(t, http.StatusOK, w.Code)
 		assert.Contains(t, w.Body.String(), "#EXTM3U")
 	}
@@ -419,7 +427,7 @@ func TestServePlaylist_RefetchesAfterCacheExpires(t *testing.T) {
 	ctx := context.Background()
 
 	w := httptest.NewRecorder()
-	s.servePlaylist(ctx, w, http.Header{})
+	s.servePlaylist(ctx, w, http.Header{}, "http://proxy.example.com")
 	assert.Equal(t, int64(1), upstreamHits.Load())
 
 	// Force the cache to look stale rather than sleeping playlistCacheTTL.
@@ -428,6 +436,6 @@ func TestServePlaylist_RefetchesAfterCacheExpires(t *testing.T) {
 	s.playlistCacheMu.Unlock()
 
 	w = httptest.NewRecorder()
-	s.servePlaylist(ctx, w, http.Header{})
+	s.servePlaylist(ctx, w, http.Header{}, "http://proxy.example.com")
 	assert.Equal(t, int64(2), upstreamHits.Load(), "expired cache should trigger a fresh upstream fetch")
 }

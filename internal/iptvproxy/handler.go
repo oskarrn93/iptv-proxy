@@ -181,7 +181,7 @@ func (p *Proxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	f.instrument(routePlaylist, w, func(w http.ResponseWriter) {
 		loggerFromContext(r.Context(), f.logger).InfoContext(r.Context(), "playlist request",
 			"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
-		f.servePlaylist(r.Context(), w, r.Header)
+		f.servePlaylist(r.Context(), w, r.Header, requestBaseURL(r))
 	})
 }
 
@@ -211,6 +211,6 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request) {
 	defer f.metrics.sessionEnded(kind)
 
 	f.instrument(routeStream, w, func(w http.ResponseWriter) {
-		f.serve(r.Context(), w, r.Header, target)
+		f.serve(r.Context(), w, r.Header, target, requestBaseURL(r))
 	})
 }

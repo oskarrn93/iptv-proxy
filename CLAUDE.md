@@ -36,7 +36,8 @@ go vet ./...
 - `internal/iptvproxy/handler.go` — HTTP routing, per-request auth (`authenticate`/`matchFeed`), request logging/instrumentation.
 - `internal/iptvproxy/service.go` — per-feed logic: playlist fetch + rewrite, stream proxying/reconnect, playlist caching.
 - `internal/iptvproxy/credentials.go` — feed credential matching.
-- `internal/iptvproxy/util.go` — URI resolution, content sniffing, buffered copy, backoff.
+- `internal/iptvproxy/util.go` — URI resolution, content sniffing, buffered copy, backoff, per-request base URL detection (`requestBaseURL`).
 - `internal/iptvproxy/metrics.go` — Prometheus metrics (feed-scoped counters/histograms).
 - No `WriteTimeout` on the HTTP server (`cmd/iptv-proxy/main.go`) — a live TS relay writes for as long as the viewer watches; don't add one.
 - Playlist cache (`cachedPlaylist`/`storePlaylistCache`) exists as both a concurrent-viewer optimization and a stale-fallback source if the upstream fetch fails — preserve stale-fallback behavior when changing fetch logic.
+- Rewritten `/stream` links carry `baseURLPlaceholder` (a sentinel, not a real host) instead of a configured `public_base_url` — there is no such config. The cached/rewritten playlist body is host-agnostic; `applyBaseURL` substitutes in the actual `scheme://host` per request (from `requestBaseURL`: `X-Forwarded-Host`/`X-Forwarded-Proto` if present, else `Host`/TLS) in `writePlaylistResponse`. This is what lets one cached playlist serve correct absolute links to clients reaching the proxy through different hostnames (LAN vs. external) without re-fetching or re-rewriting per host.

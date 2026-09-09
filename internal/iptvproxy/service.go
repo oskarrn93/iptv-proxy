@@ -47,9 +47,6 @@ type feedService struct {
 	name    string
 	target  *url.URL
 	timeout time.Duration
-	// publicBaseURL, when non-empty, is prepended to every rewritten /stream
-	// link so playlist entries are absolute URLs (see FeedConfig.PublicBaseURL).
-	publicBaseURL string
 	// excludeGroupPrefixes is cfg.ExcludeGroupPrefixes lowercased once here
 	// rather than per playlist line (see FeedConfig.ExcludeGroupPrefixes).
 	excludeGroupPrefixes []string
@@ -144,7 +141,6 @@ func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logge
 		name:                 cfg.Name,
 		target:               target,
 		timeout:              cfg.Timeout,
-		publicBaseURL:        strings.TrimSuffix(cfg.PublicBaseURL, "/"),
 		excludeGroupPrefixes: lowercaseAll(cfg.ExcludeGroupPrefixes),
 		hideCredentials:      hide,
 		restoreCredentials:   hide.reversed(),
@@ -282,14 +278,34 @@ func (s *feedService) rewritePlaylist(r io.Reader, srcURL *url.URL, sizeHint int
 	return strings.Clone(out.String()), nil
 }
 
+// baseURLPlaceholder stands in for the client-facing scheme://host in every
+// link writeStreamURI writes into a cached playlist. The real host a client
+// reached this proxy through is only known per-request (see
+// requestBaseURL), while a playlist is fetched/rewritten once and shared
+// across every client and host it's cached for — so the actual host is
+// substituted in at response time (applyBaseURL) rather than baked in here.
+// Chosen to contain characters (`\x00`) that can never appear in an upstream
+// playlist body, so ReplaceAll can never match anything but this placeholder.
+const baseURLPlaceholder = "\x00BASEURL\x00"
+
+// applyBaseURL substitutes the requesting client's own scheme://host (see
+// requestBaseURL) for every baseURLPlaceholder a cached/rewritten playlist
+// carries, making its links absolute for that client without needing the
+// playlist rewritten (or cached separately) per host.
+func applyBaseURL(body, baseURL string) string {
+	return strings.ReplaceAll(body, baseURLPlaceholder, baseURL)
+}
+
 // writeStreamURI writes the link that stands in for one upstream URI, shaped
 // like a standard Xtream stream URL — /<prefix>/<username>/<password>/<file>
 // — so IPTV clients that parse or rely on that convention (rather than
 // treating the M3U entry as an opaque URL) keep working. The username and
 // password are this feed's own configured credentials, standing exactly where
 // the upstream's stood, so a client sees a plausible stream URL while the
-// upstream host and the upstream's own credentials never appear in it.
-// handleStream reverses this to recover the upstream URL — see streamTarget.
+// upstream host and the upstream's own credentials never appear in it. The
+// host portion is written as baseURLPlaceholder, filled in per-request by
+// applyBaseURL. handleStream reverses this to recover the upstream URL — see
+// streamTarget.
 //
 // Only credentials the config knows about can be swapped out, which for an
 // Xtream feed is exactly the pair its upstream_url carries and repeats in
@@ -301,7 +317,7 @@ func (s *feedService) rewritePlaylist(r io.Reader, srcURL *url.URL, sizeHint int
 func (s *feedService) writeStreamURI(out *strings.Builder, resolved *url.URL) {
 	path, query := s.hideCredentials.apply(resolved.EscapedPath(), resolved.RawQuery)
 	prefix, rest := streamURIPathParts(path, s.creds)
-	out.WriteString(s.publicBaseURL)
+	out.WriteString(baseURLPlaceholder)
 	out.WriteByte('/')
 	out.WriteString(prefix)
 	out.WriteByte('/')
@@ -532,12 +548,15 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 	http.Error(w, msg, status)
 }
 
-// writePlaylistResponse writes a fetched (or cached) playlist result to w.
-func writePlaylistResponse(w http.ResponseWriter, result playlistFetchResult) {
+// writePlaylistResponse writes a fetched (or cached) playlist result to w,
+// with baseURLPlaceholder resolved to this particular request's own
+// scheme://host (see requestBaseURL) so its links are absolute for whichever
+// host the client actually reached this proxy through.
+func writePlaylistResponse(w http.ResponseWriter, result playlistFetchResult, baseURL string) {
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(result.status)
-	io.WriteString(w, result.body)
+	io.WriteString(w, applyBaseURL(result.body, baseURL))
 }
 
 // servePlaylist serves this feed's top-level playlist. A request within
@@ -546,12 +565,12 @@ func writePlaylistResponse(w http.ResponseWriter, result playlistFetchResult) {
 // playlistGroup, shared with any other request racing it for the same
 // refresh. shared reports whether this particular call rode along on another
 // in-flight fetch rather than triggering its own.
-func (s *feedService) servePlaylist(reqCtx context.Context, w http.ResponseWriter, reqHeader http.Header) {
+func (s *feedService) servePlaylist(reqCtx context.Context, w http.ResponseWriter, reqHeader http.Header, baseURL string) {
 	logger := loggerFromContext(reqCtx, s.logger)
 
 	if result, ok := s.cachedPlaylist(); ok {
 		logger.InfoContext(reqCtx, "playlist fetch", "cached", true)
-		writePlaylistResponse(w, result)
+		writePlaylistResponse(w, result, baseURL)
 		return
 	}
 
@@ -567,13 +586,13 @@ func (s *feedService) servePlaylist(reqCtx context.Context, w http.ResponseWrite
 
 	result := v.(playlistFetchResult)
 	s.storePlaylistCache(result)
-	writePlaylistResponse(w, result)
+	writePlaylistResponse(w, result, baseURL)
 }
 
 // serve fetches target through the repository and writes the appropriate
 // response to w: a rewritten playlist, a copied VOD segment, or a
 // reconnecting live TS relay.
-func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHeader http.Header, target *url.URL) {
+func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHeader http.Header, target *url.URL, baseURL string) {
 	logger := loggerFromContext(reqCtx, s.logger)
 	tctx, cancel := s.upstreamContext(reqCtx, target)
 	defer cancel()
@@ -607,7 +626,7 @@ func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHe
 			writeUpstreamError(w, err)
 			return
 		}
-		writePlaylistResponse(w, result)
+		writePlaylistResponse(w, result, baseURL)
 		return
 	}
 

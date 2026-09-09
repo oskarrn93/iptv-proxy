@@ -33,15 +33,6 @@ type FeedConfig struct {
 	// two can't be passed around, matched, or rewritten separately.
 	Credentials `yaml:",inline"`
 	Timeout     time.Duration `yaml:"timeout"`
-	// PublicBaseURL, when set, is prepended to every rewritten /stream link
-	// (e.g. "http://server.example.com:58034") so the served playlist's
-	// channel entries are absolute URLs instead of paths relative to this
-	// feed's own listen_addr. A plain M3U channel list (unlike an HLS media
-	// sub-playlist) has no notion of a base URI to resolve a relative entry
-	// against, so most IPTV players reject the whole file as invalid unless
-	// this is set. Left empty, entries stay relative for backward
-	// compatibility.
-	PublicBaseURL string `yaml:"public_base_url" validate:"omitempty,http_url"`
 	// ExcludeGroupPrefixes drops any playlist entry whose group-title starts
 	// with one of these prefixes (case-insensitive), e.g. ["movies:", "series:"]
 	// to strip VOD out of an Xtream m3u_plus feed and keep only live channels.
