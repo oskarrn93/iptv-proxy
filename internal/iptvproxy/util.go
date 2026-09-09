@@ -147,7 +147,12 @@ func isTSStream(target *url.URL, contentType string, peeked []byte) bool {
 // bufferedCopy streams r to w, flushing as it goes, and reports how many
 // bytes reached the client. The count lets the reconnect loop tell a stream
 // that ran for a while from one that returns EOF immediately.
-func bufferedCopy(w http.ResponseWriter, r io.Reader) (int64, error) {
+//
+// lastChunk, if non-nil, is overwritten with a copy of the most recent chunk
+// written to w — letting a caller replay it after the read loop ends, to
+// bridge a reconnect gap instead of leaving the client with silence. Pass
+// nil when the caller has no use for it (finite bodies aren't reconnected).
+func bufferedCopy(w http.ResponseWriter, r io.Reader, lastChunk *[]byte) (int64, error) {
 	// ResponseController rather than a w.(http.Flusher) assertion: it unwraps a
 	// wrapped ResponseWriter instead of silently never flushing, which on a live
 	// stream would leave the client with nothing until a buffer filled. A writer
@@ -160,6 +165,9 @@ func bufferedCopy(w http.ResponseWriter, r io.Reader) (int64, error) {
 		if n > 0 {
 			nw, errw := w.Write(buf[:n])
 			written += int64(nw)
+			if lastChunk != nil {
+				*lastChunk = append((*lastChunk)[:0], buf[:n]...)
+			}
 			if errw != nil {
 				return written, errw
 			}

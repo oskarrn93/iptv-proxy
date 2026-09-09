@@ -87,7 +87,7 @@ func TestBufferedCopy(t *testing.T) {
 	rec := httptest.NewRecorder()
 	src := strings.NewReader("hello world")
 
-	n, err := bufferedCopy(rec, src)
+	n, err := bufferedCopy(rec, src, nil)
 	require.NoError(t, err)
 	assert.Equal(t, int64(len("hello world")), n)
 	assert.Equal(t, "hello world", rec.Body.String())

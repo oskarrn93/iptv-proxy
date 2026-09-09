@@ -757,7 +757,7 @@ func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHe
 		return
 	}
 
-	if _, err := bufferedCopy(w, buf); err != nil {
+	if _, err := bufferedCopy(w, buf, nil); err != nil {
 		logger.ErrorContext(reqCtx, "proxy copy failed", "error", redactErr(err))
 	}
 }
@@ -768,6 +768,14 @@ func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHe
 // counting it this loop would refetch without pause forever. The budget resets
 // whenever a connection actually delivered data, so a stream that survives for
 // hours can still reconnect more than maxReconnects times in total.
+//
+// The reconnect+backoff gap would otherwise leave the client's socket
+// completely idle — no bytes, no error — which reads to a player as a stall
+// (spinner, or the player timing out the connection) rather than a brief
+// glitch. Immediately replaying the last chunk that was actually flushed to
+// the client bridges that gap: the player decodes it as a very brief freeze
+// instead, and keeps reading from what still looks like a live connection
+// while the upstream reconnect happens.
 func (s *feedService) streamWithReconnect(ctx context.Context, w http.ResponseWriter, target *url.URL, initialBody io.ReadCloser) error {
 	logger := loggerFromContext(ctx, s.logger)
 	currentBody := initialBody
@@ -779,9 +787,10 @@ func (s *feedService) streamWithReconnect(ctx context.Context, w http.ResponseWr
 
 	attempts := 0
 	wait := retryDelay
+	var lastChunk []byte
 
 	for {
-		written, err := bufferedCopy(w, currentBody)
+		written, err := bufferedCopy(w, currentBody, &lastChunk)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -803,6 +812,16 @@ func (s *feedService) streamWithReconnect(ctx context.Context, w http.ResponseWr
 		currentBody.Close()
 		currentBody = nil
 		s.metrics.streamReconnects.Inc()
+
+		if len(lastChunk) > 0 {
+			if _, werr := w.Write(lastChunk); werr != nil {
+				return werr
+			}
+			if ferr := http.NewResponseController(w).Flush(); ferr != nil && !errors.Is(ferr, http.ErrNotSupported) {
+				return ferr
+			}
+		}
+
 		wait = sleepWithBackoff(wait)
 		if ctx.Err() != nil {
 			return ctx.Err()
