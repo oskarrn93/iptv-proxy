@@ -11,10 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
-
-	"golang.org/x/sync/singleflight"
 )
 
 const maxReconnects = 3
@@ -80,30 +77,21 @@ type feedService struct {
 	repo          *upstreamRepository
 	logger        *slog.Logger
 	metrics       *feedMetrics
-	// playlistGroup coalesces concurrent requests for this feed's playlist
+	// playlistCache coalesces concurrent requests for this feed's playlist
 	// into a single upstream fetch — a channel list can be tens of megabytes,
 	// and IPTV apps routinely poll it every few seconds from multiple
-	// devices, so without this every viewer multiplies upstream load.
-	playlistGroup singleflight.Group
-	// playlistCacheMu guards playlistCache/playlistCachedAt. Reads and writes
-	// happen outside playlistGroup's own critical section (a cache hit skips
-	// playlistGroup.Do entirely), so they need their own lock rather than
-	// riding on singleflight's. A zero playlistCachedAt means nothing has been
-	// cached yet, so the entry needs no separate "is set" flag.
-	playlistCacheMu  sync.Mutex
-	playlistCache    playlistFetchResult
-	playlistCachedAt time.Time
-	// epgGroup/epgCacheMu/epgCache/epgCachedAt mirror the playlist fields
-	// above for the EPG route, coalescing concurrent fetches of the same
-	// multi-megabyte XMLTV guide and caching the result for epgCacheTTL.
-	epgGroup    singleflight.Group
-	epgCacheMu  sync.Mutex
-	epgCache    epgFetchResult
-	epgCachedAt time.Time
+	// devices, so without this every viewer multiplies upstream load — and
+	// serves the result for playlistCacheTTL before the next request
+	// triggers a fresh fetch.
+	playlistCache *singleflightCache[playlistFetchResult]
+	// epgCache mirrors playlistCache for the EPG route, coalescing concurrent
+	// fetches of the same multi-megabyte XMLTV guide and caching the result
+	// for epgCacheTTL.
+	epgCache *singleflightCache[epgFetchResult]
 }
 
 // playlistFetchResult is the outcome of one upstream playlist fetch, shared
-// verbatim across every request coalesced onto it by playlistGroup.
+// verbatim across every request coalesced onto it by feedService.playlistCache.
 type playlistFetchResult struct {
 	body   string
 	status int
@@ -120,7 +108,7 @@ type playlistFetchError struct {
 func (e *playlistFetchError) Error() string { return e.msg }
 
 // epgFetchResult is the outcome of one upstream XMLTV fetch, shared verbatim
-// across every request coalesced onto it by epgGroup. Unlike a playlist, an
+// across every request coalesced onto it by feedService.epgCache. Unlike a playlist, an
 // EPG body is opaque to this proxy — nothing in it needs rewriting, since an
 // XMLTV guide carries channel ids/titles, not upstream stream URLs — so it is
 // cached and served as-is, with only its upstream Content-Type carried along.
@@ -183,6 +171,8 @@ func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logge
 		repo:                 repo,
 		logger:               logger,
 		metrics:              metrics,
+		playlistCache:        newSingleflightCache[playlistFetchResult](playlistCacheTTL, playlistGroupKey),
+		epgCache:             newSingleflightCache[epgFetchResult](epgCacheTTL, epgGroupKey),
 	}, nil
 }
 
@@ -565,26 +555,6 @@ func (s *feedService) readAndRewrite(ctx context.Context, body io.Reader, target
 	return playlistFetchResult{body: rewritten, status: status}, nil
 }
 
-// cachedPlaylist returns the last successfully fetched playlist if it is
-// still within playlistCacheTTL.
-func (s *feedService) cachedPlaylist() (playlistFetchResult, bool) {
-	s.playlistCacheMu.Lock()
-	defer s.playlistCacheMu.Unlock()
-	if s.playlistCachedAt.IsZero() || time.Since(s.playlistCachedAt) > playlistCacheTTL {
-		return playlistFetchResult{}, false
-	}
-	return s.playlistCache, true
-}
-
-// storePlaylistCache records the result of a successful upstream fetch for
-// cachedPlaylist to serve until it ages out.
-func (s *feedService) storePlaylistCache(result playlistFetchResult) {
-	s.playlistCacheMu.Lock()
-	defer s.playlistCacheMu.Unlock()
-	s.playlistCache = result
-	s.playlistCachedAt = time.Now()
-}
-
 // fetchEPG fetches this feed's XMLTV guide from upstream. Only ever called
 // from inside epgGroup.Do, for the same reason fetchPlaylist is: its result is
 // shared across every request coalesced onto the same call, so it fetches
@@ -618,26 +588,6 @@ func (s *feedService) fetchEPG() (epgFetchResult, error) {
 	return epgFetchResult{body: body, status: resp.StatusCode, contentType: contentType}, nil
 }
 
-// cachedEPG returns the last successfully fetched EPG guide if it is still
-// within epgCacheTTL.
-func (s *feedService) cachedEPG() (epgFetchResult, bool) {
-	s.epgCacheMu.Lock()
-	defer s.epgCacheMu.Unlock()
-	if s.epgCachedAt.IsZero() || time.Since(s.epgCachedAt) > epgCacheTTL {
-		return epgFetchResult{}, false
-	}
-	return s.epgCache, true
-}
-
-// storeEPGCache records the result of a successful upstream fetch for
-// cachedEPG to serve until it ages out.
-func (s *feedService) storeEPGCache(result epgFetchResult) {
-	s.epgCacheMu.Lock()
-	defer s.epgCacheMu.Unlock()
-	s.epgCache = result
-	s.epgCachedAt = time.Now()
-}
-
 // writeEPGResponse writes a fetched (or cached) EPG result to w verbatim — an
 // XMLTV guide carries no upstream URLs, so unlike a playlist it needs no
 // per-request host substitution.
@@ -656,15 +606,13 @@ func writeEPGResponse(w http.ResponseWriter, result epgFetchResult) {
 func (s *feedService) serveEPG(reqCtx context.Context, w http.ResponseWriter) {
 	logger := loggerFromContext(reqCtx, s.logger)
 
-	if result, ok := s.cachedEPG(); ok {
+	if result, ok := s.epgCache.get(); ok {
 		logger.InfoContext(reqCtx, "epg fetch", "cached", true)
 		writeEPGResponse(w, result)
 		return
 	}
 
-	v, err, shared := s.epgGroup.Do(epgGroupKey, func() (any, error) {
-		return s.fetchEPG()
-	})
+	result, shared, err := s.epgCache.fetch(s.fetchEPG)
 	logger.InfoContext(reqCtx, "epg fetch", "cached", false, "coalesced", shared)
 
 	if err != nil {
@@ -672,8 +620,7 @@ func (s *feedService) serveEPG(reqCtx context.Context, w http.ResponseWriter) {
 		return
 	}
 
-	result := v.(epgFetchResult)
-	s.storeEPGCache(result)
+	s.epgCache.store(result)
 	writeEPGResponse(w, result)
 }
 
@@ -710,13 +657,13 @@ func writePlaylistResponse(w http.ResponseWriter, result playlistFetchResult, ba
 func (s *feedService) servePlaylist(reqCtx context.Context, w http.ResponseWriter, reqHeader http.Header, baseURL string) {
 	logger := loggerFromContext(reqCtx, s.logger)
 
-	if result, ok := s.cachedPlaylist(); ok {
+	if result, ok := s.playlistCache.get(); ok {
 		logger.InfoContext(reqCtx, "playlist fetch", "cached", true)
 		writePlaylistResponse(w, result, baseURL)
 		return
 	}
 
-	v, err, shared := s.playlistGroup.Do(playlistGroupKey, func() (any, error) {
+	result, shared, err := s.playlistCache.fetch(func() (playlistFetchResult, error) {
 		return s.fetchPlaylist(reqHeader)
 	})
 	logger.InfoContext(reqCtx, "playlist fetch", "cached", false, "coalesced", shared)
@@ -726,8 +673,7 @@ func (s *feedService) servePlaylist(reqCtx context.Context, w http.ResponseWrite
 		return
 	}
 
-	result := v.(playlistFetchResult)
-	s.storePlaylistCache(result)
+	s.playlistCache.store(result)
 	writePlaylistResponse(w, result, baseURL)
 }
 

@@ -449,9 +449,7 @@ func TestServePlaylist_RefetchesAfterCacheExpires(t *testing.T) {
 	assert.Equal(t, int64(1), upstreamHits.Load())
 
 	// Force the cache to look stale rather than sleeping playlistCacheTTL.
-	s.playlistCacheMu.Lock()
-	s.playlistCachedAt = time.Now().Add(-playlistCacheTTL - time.Second)
-	s.playlistCacheMu.Unlock()
+	s.playlistCache.backdate(playlistCacheTTL + time.Second)
 
 	w = httptest.NewRecorder()
 	s.servePlaylist(ctx, w, http.Header{}, "http://proxy.example.com")
