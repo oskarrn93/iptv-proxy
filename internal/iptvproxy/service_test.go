@@ -295,6 +295,37 @@ func TestRewritePlaylist_HidesEmbeddedUpstreamCredentials(t *testing.T) {
 	assert.Equal(t, "http://upstream.example.com/live/xtreamuser/xtreampass/12345.ts", targets[0])
 }
 
+// TestRewritePlaylist_HidesEmbeddedUpstreamCredentialsNoTypeSegment covers an
+// upstream that omits the type segment for live channels — the path is just
+// /<user>/<pass>/<id>.ts, credentials at the very start rather than after a
+// "live"/"movie"/etc. segment. Regression test: this used to be
+// indistinguishable from an unrecognized shape, so the whole path (including
+// the credentials) was carried as-is in rest and writeStreamURI's own
+// username/password segments duplicated the ones already inside it, emitting
+// /stream/alice/secret/alice/secret/12345.ts instead of
+// /stream/alice/secret/12345.ts.
+func TestRewritePlaylist_HidesEmbeddedUpstreamCredentialsNoTypeSegment(t *testing.T) {
+	s := newTestService(t, "http://upstream.example.com/get.php?username=xtreamuser&password=xtreampass")
+	srcURL, _ := url.Parse("http://upstream.example.com/live/index.m3u8")
+
+	body := []byte("#EXTM3U\n#EXTINF:10,\nhttp://upstream.example.com/xtreamuser/xtreampass/12345.ts\n")
+
+	out, err := rewriteBody(s, body, srcURL)
+	require.NoError(t, err)
+
+	assert.NotContains(t, out, "upstream.example.com")
+	assert.NotContains(t, out, "xtreamuser")
+	assert.NotContains(t, out, "xtreampass")
+
+	// The credentials must appear exactly once, not duplicated.
+	assert.Contains(t, out, "/alice/secret/12345.ts")
+	assert.NotContains(t, out, "/alice/secret/alice/secret/12345.ts")
+
+	targets := resolveStreamLinks(t, s, out)
+	require.Len(t, targets, 1)
+	assert.Equal(t, "http://upstream.example.com/xtreamuser/xtreampass/12345.ts", targets[0])
+}
+
 // TestRewritePlaylist_HidesCredentialsOutsideXtreamShape covers a path that
 // carries the upstream credentials somewhere other than the two segments an
 // Xtream stream URL puts them in — Xtream's own HLS segment paths
@@ -329,7 +360,9 @@ func TestStreamURIPathParts_RoundTrip(t *testing.T) {
 		"/timeshift/alice/secret/60/2024-01-01:00-00/12345.ts",
 		"/live/segment1.ts",
 		"/hlsr/tok3n/alice/secret/451/9/12345.ts",
-		"/stream/alice/secret/12345.ts", // collides with fallbackStreamPrefix
+		"/stream/alice/secret/12345.ts",         // collides with fallbackStreamPrefix
+		"/alice/secret/12345.ts",                // no type segment, credentials at the start
+		"/stream-no-type/alice/secret/12345.ts", // collides with noTypeStreamPrefix
 		"/",
 		"",
 	}

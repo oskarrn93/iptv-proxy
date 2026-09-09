@@ -322,6 +322,17 @@ func (s *feedService) writeStreamURI(out *strings.Builder, resolved *url.URL) {
 // real prefix, so streamURIPath can tell the two forms apart with certainty.
 const fallbackStreamPrefix = "stream"
 
+// noTypeStreamPrefix marks a path shaped like /<username>/<password>/<file...>
+// — credentials right at the start, with no leading type segment (some
+// upstreams omit "live"/"movie"/etc. for live channels). Without a distinct
+// marker for this shape it would fall through to fallbackStreamPrefix, whose
+// reconstruction carries rest verbatim — but rest here is exactly
+// "<username>/<password>/<file>", so writeStreamURI's explicit
+// username/password segments would duplicate the ones already inside rest.
+// streamURIPathParts never emits it as a real prefix, so streamURIPath can
+// tell this shape apart from both the standard and fallback ones.
+const noTypeStreamPrefix = "stream-no-type"
+
 // streamURIPathParts splits a credential-swapped upstream path — this feed's
 // username/password already standing where the upstream's did — into the
 // prefix and trailing segments of the link writeStreamURI emits. A standard
@@ -330,31 +341,49 @@ const fallbackStreamPrefix = "stream"
 // /timeshift/u/p/60/2024-01-01:00-00/12345.ts); when the path has that shape
 // the prefix and the segments after the credentials are reused verbatim, so
 // the link is indistinguishable in structure from a real Xtream one and
-// streamURIPath can put the credentials back where they came from. Every other
-// shape — a path with the credentials elsewhere or not at all — falls back to
-// carrying the whole path after the credentials instead.
+// streamURIPath can put the credentials back where they came from. Some
+// upstreams instead omit the type segment entirely for live channels —
+// /<username>/<password>/<file...>, credentials at the very start — which
+// this also recognizes so its credentials aren't left in rest to be
+// duplicated by writeStreamURI's explicit username/password segments. Every
+// other shape — a path with the credentials elsewhere or not at all — falls
+// back to carrying the whole path after the credentials instead.
 func streamURIPathParts(path string, creds Credentials) (prefix, rest string) {
 	trimmed := strings.Trim(path, "/")
 	// SplitN(..., 4) caps the allocation and leaves anything past the 3rd
 	// slash as one unsplit segment, so no strings.Join is needed to rebuild it.
 	segments := strings.SplitN(trimmed, "/", 4)
-	if len(segments) < 3 || segments[0] == fallbackStreamPrefix || segments[1] != creds.Username || segments[2] != creds.Password {
-		return fallbackStreamPrefix, trimmed
+	if len(segments) >= 3 && segments[0] != fallbackStreamPrefix && segments[0] != noTypeStreamPrefix &&
+		segments[1] == creds.Username && segments[2] == creds.Password {
+		if len(segments) == 4 {
+			rest = segments[3]
+		}
+		return segments[0], rest
 	}
-	if len(segments) == 4 {
-		rest = segments[3]
+
+	segments3 := strings.SplitN(trimmed, "/", 3)
+	if len(segments3) >= 2 && segments3[0] == creds.Username && segments3[1] == creds.Password {
+		if len(segments3) == 3 {
+			rest = segments3[2]
+		}
+		return noTypeStreamPrefix, rest
 	}
-	return segments[0], rest
+
+	return fallbackStreamPrefix, trimmed
 }
 
 // streamURIPath rejoins what streamURIPathParts split, returning the upstream
 // path with this feed's credentials still standing in for the upstream's (see
 // streamTarget, which swaps them back).
 func streamURIPath(prefix string, creds Credentials, rest string) string {
-	if prefix == fallbackStreamPrefix {
+	switch prefix {
+	case fallbackStreamPrefix:
 		return "/" + rest
+	case noTypeStreamPrefix:
+		return "/" + creds.Username + "/" + creds.Password + "/" + rest
+	default:
+		return "/" + prefix + "/" + creds.Username + "/" + creds.Password + "/" + rest
 	}
-	return "/" + prefix + "/" + creds.Username + "/" + creds.Password + "/" + rest
 }
 
 // attrURIPattern matches one quoted URI= attribute on an #EXT-X-KEY /
