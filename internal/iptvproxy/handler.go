@@ -91,14 +91,15 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 }
 
 // instrument runs next, then records the outcome against the matched feed's
-// own metrics under the given route label. Which feed that is isn't known
-// until authentication resolves it, so — unlike the old per-feed handler —
-// this is called per request rather than wrapped once at Mux() build time.
-func (s *feedService) instrument(r route, w http.ResponseWriter, next func(w http.ResponseWriter)) {
+// own metrics under the given route label and the host the client reached
+// this proxy at. Which feed that is isn't known until authentication
+// resolves it, so — unlike the old per-feed handler — this is called per
+// request rather than wrapped once at Mux() build time.
+func (s *feedService) instrument(r route, host string, w http.ResponseWriter, next func(w http.ResponseWriter)) {
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	start := time.Now()
 	next(rec)
-	s.metrics.observeRequest(r, rec.status, time.Since(start))
+	s.metrics.observeRequest(r, host, rec.status, time.Since(start))
 }
 
 // withRequestLogger stamps every request with its own request_id and attaches
@@ -140,7 +141,7 @@ func (p *Proxy) rejectUnauthorized(w http.ResponseWriter, r *http.Request, candi
 		logger = logger.With("feed", candidate.name)
 	}
 	logger.WarnContext(r.Context(), "auth failed",
-		"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+		"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr, "host", requestHost(r))
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
 }
 
@@ -179,9 +180,9 @@ func (p *Proxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	if f == nil {
 		return
 	}
-	f.instrument(routePlaylist, w, func(w http.ResponseWriter) {
+	f.instrument(routePlaylist, requestHost(r), w, func(w http.ResponseWriter) {
 		loggerFromContext(r.Context(), f.logger).InfoContext(r.Context(), "playlist request",
-			"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+			"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr, "host", requestHost(r))
 		f.servePlaylist(r.Context(), w, r.Header, requestBaseURL(r))
 	})
 }
@@ -195,9 +196,9 @@ func (p *Proxy) handleEPG(w http.ResponseWriter, r *http.Request) {
 	if f == nil {
 		return
 	}
-	f.instrument(routeEPG, w, func(w http.ResponseWriter) {
+	f.instrument(routeEPG, requestHost(r), w, func(w http.ResponseWriter) {
 		loggerFromContext(r.Context(), f.logger).InfoContext(r.Context(), "epg request",
-			"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+			"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr, "host", requestHost(r))
 		f.serveEPG(r.Context(), w)
 	})
 }
@@ -227,7 +228,7 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request) {
 	f.metrics.sessionStarted(kind)
 	defer f.metrics.sessionEnded(kind)
 
-	f.instrument(routeStream, w, func(w http.ResponseWriter) {
+	f.instrument(routeStream, requestHost(r), w, func(w http.ResponseWriter) {
 		f.serve(r.Context(), w, r.Header, target, requestBaseURL(r))
 	})
 }

@@ -58,11 +58,6 @@ var forwardedResponseHeaders = []string{"Content-Length", "Content-Range", "Acce
 // playlist serve LAN and external clients alike, each seeing links back to
 // whichever host they themselves connected through.
 func requestBaseURL(r *http.Request) string {
-	host := r.Host
-	if fwd := firstForwarded(r.Header.Get("X-Forwarded-Host")); fwd != "" {
-		host = fwd
-	}
-
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
@@ -71,7 +66,19 @@ func requestBaseURL(r *http.Request) string {
 		scheme = fwd
 	}
 
-	return scheme + "://" + host
+	return scheme + "://" + requestHost(r)
+}
+
+// requestHost derives the host a client actually reached this proxy at,
+// e.g. "iptv.oskarrosen.io" or "192.168.1.12:8080" — the same
+// X-Forwarded-Host-over-Host precedence as requestBaseURL, but without the
+// scheme, for attaching to logs/metrics as "which entry point was this
+// request made through" (LAN vs. external).
+func requestHost(r *http.Request) string {
+	if fwd := firstForwarded(r.Header.Get("X-Forwarded-Host")); fwd != "" {
+		return fwd
+	}
+	return r.Host
 }
 
 // firstForwarded returns the first comma-separated value in an

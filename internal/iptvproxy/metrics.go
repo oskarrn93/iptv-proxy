@@ -47,6 +47,7 @@ const (
 	labelRoute  = "route"
 	labelStatus = "status"
 	labelKind   = "kind"
+	labelHost   = "host"
 )
 
 // feedMetrics holds one feed's Prometheus collectors on their own registry
@@ -79,9 +80,9 @@ func newFeedMetrics(feed string, enabled bool, logger *slog.Logger) *feedMetrics
 	m := &feedMetrics{
 		requestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name:        "iptv_proxy_http_requests_total",
-			Help:        "Total HTTP requests handled, by route and status code.",
+			Help:        "Total HTTP requests handled, by route, status code, and the host the client reached this proxy at.",
 			ConstLabels: constLabels,
-		}, []string{labelRoute, labelStatus}),
+		}, []string{labelRoute, labelStatus, labelHost}),
 		requestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:        "iptv_proxy_http_request_duration_seconds",
 			Help:        "HTTP request duration in seconds, by route.",
@@ -125,11 +126,14 @@ func newFeedMetrics(feed string, enabled bool, logger *slog.Logger) *feedMetrics
 	return m
 }
 
-// observeRequest records a completed request's outcome under the typed route
-// and status, keeping the strconv.Itoa/WithLabelValues plumbing out of
-// callers.
-func (m *feedMetrics) observeRequest(r route, status int, duration time.Duration) {
-	m.requestsTotal.WithLabelValues(string(r), strconv.Itoa(status)).Inc()
+// observeRequest records a completed request's outcome under the typed route,
+// status, and host (the client-facing host it reached this proxy at, from
+// requestHost), keeping the strconv.Itoa/WithLabelValues plumbing out of
+// callers. host isn't a requestDuration label, to keep that histogram's
+// series count from multiplying by however many hostnames route to this
+// proxy.
+func (m *feedMetrics) observeRequest(r route, host string, status int, duration time.Duration) {
+	m.requestsTotal.WithLabelValues(string(r), strconv.Itoa(status), host).Inc()
 	m.requestDuration.WithLabelValues(string(r)).Observe(duration.Seconds())
 }
 
