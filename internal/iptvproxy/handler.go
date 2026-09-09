@@ -203,7 +203,13 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target := f.streamTarget(r.PathValue("prefix"), r.PathValue("rest"), r.URL.RawQuery)
+	prefix := r.PathValue("prefix")
+	target := f.streamTarget(prefix, r.PathValue("rest"), r.URL.RawQuery)
+
+	kind := classifySessionKind(prefix)
+	f.metrics.sessionStarted(kind)
+	defer f.metrics.sessionEnded(kind)
+
 	f.instrument(routeStream, w, func(w http.ResponseWriter) {
 		f.serve(r.Context(), w, r.Header, target)
 	})

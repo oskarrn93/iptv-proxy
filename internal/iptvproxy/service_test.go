@@ -376,6 +376,26 @@ func TestStreamURIPathParts_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestClassifySessionKind(t *testing.T) {
+	cases := []struct {
+		prefix string
+		want   sessionKind
+	}{
+		{"live", sessionKindLive},
+		{noTypeStreamPrefix, sessionKindLive},
+		{"movie", sessionKindVOD},
+		{"series", sessionKindVOD},
+		{"timeshift", sessionKindOther},
+		{fallbackStreamPrefix, sessionKindOther},
+		{"hlsr", sessionKindOther},
+	}
+	for _, tc := range cases {
+		t.Run(tc.prefix, func(t *testing.T) {
+			assert.Equal(t, tc.want, classifySessionKind(tc.prefix))
+		})
+	}
+}
+
 func TestServePlaylist_CachesAcrossRequests(t *testing.T) {
 	upstream, upstreamHits := newCountingPlaylistUpstream(t)
 

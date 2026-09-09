@@ -372,6 +372,28 @@ func streamURIPathParts(path string, creds Credentials) (prefix, rest string) {
 	return fallbackStreamPrefix, trimmed
 }
 
+// vodStreamPrefixes are the Xtream path prefixes streamURIPathParts emits for
+// on-demand content (movie/series), as opposed to a live channel. Used to
+// classify a /stream request's sessionKind from its prefix alone, before
+// anything is fetched from upstream.
+var vodStreamPrefixes = map[string]bool{"movie": true, "series": true}
+
+// classifySessionKind reports what kind of /stream request prefix identifies,
+// for the activeSessions gauge. noTypeStreamPrefix and the standard "live"
+// prefix are both live channels; movie/series are VOD; anything else
+// (timeshift, catch-up, or a non-standard upstream shape via
+// fallbackStreamPrefix) is bucketed as "other" rather than guessed at.
+func classifySessionKind(prefix string) sessionKind {
+	switch {
+	case prefix == "live" || prefix == noTypeStreamPrefix:
+		return sessionKindLive
+	case vodStreamPrefixes[prefix]:
+		return sessionKindVOD
+	default:
+		return sessionKindOther
+	}
+}
+
 // streamURIPath rejoins what streamURIPathParts split, returning the upstream
 // path with this feed's credentials still standing in for the upstream's (see
 // streamTarget, which swaps them back).

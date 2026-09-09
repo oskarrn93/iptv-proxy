@@ -28,6 +28,17 @@ const (
 	errorKindHTTPError   errorKind = "http_error"
 )
 
+// sessionKind identifies what a /stream request is for, used as the
+// "kind" label on activeSessions. It's classified from the URL prefix alone
+// (see classifySessionKind), before anything is fetched from upstream.
+type sessionKind string
+
+const (
+	sessionKindLive  sessionKind = "live"
+	sessionKindVOD   sessionKind = "vod"
+	sessionKindOther sessionKind = "other"
+)
+
 // Metric label names, kept as constants alongside the label values above so
 // every string that appears in a metric's identity is named once.
 const (
@@ -58,6 +69,7 @@ type feedMetrics struct {
 	authFailures     prometheus.Counter
 	upstreamErrors   *prometheus.CounterVec
 	streamReconnects prometheus.Counter
+	activeSessions   *prometheus.GaugeVec
 }
 
 func newFeedMetrics(feed string, enabled bool, logger *slog.Logger) *feedMetrics {
@@ -90,6 +102,11 @@ func newFeedMetrics(feed string, enabled bool, logger *slog.Logger) *feedMetrics
 			Help:        "Total live TS stream reconnects.",
 			ConstLabels: constLabels,
 		}),
+		activeSessions: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name:        "iptv_proxy_active_sessions",
+			Help:        "Currently open /stream requests, by kind (live channel, vod, or other).",
+			ConstLabels: constLabels,
+		}, []string{labelKind}),
 	}
 
 	if !enabled {
@@ -97,7 +114,7 @@ func newFeedMetrics(feed string, enabled bool, logger *slog.Logger) *feedMetrics
 	}
 
 	registry := prometheus.NewRegistry()
-	for _, c := range []prometheus.Collector{m.requestsTotal, m.requestDuration, m.authFailures, m.upstreamErrors, m.streamReconnects} {
+	for _, c := range []prometheus.Collector{m.requestsTotal, m.requestDuration, m.authFailures, m.upstreamErrors, m.streamReconnects, m.activeSessions} {
 		if err := registry.Register(c); err != nil {
 			logger.Error("metrics registration failed, /metrics disabled for this feed", "feed", feed, "error", err)
 			return m
@@ -118,4 +135,16 @@ func (m *feedMetrics) observeRequest(r route, status int, duration time.Duration
 // recordUpstreamError increments upstreamErrors for the given kind.
 func (m *feedMetrics) recordUpstreamError(kind errorKind) {
 	m.upstreamErrors.WithLabelValues(string(kind)).Inc()
+}
+
+// sessionStarted/sessionEnded bracket one /stream request's lifetime so
+// activeSessions reflects how many are open right now, by kind. Called around
+// the full handler (not just the upstream fetch) so a slow or stalled client
+// still counts as an open session.
+func (m *feedMetrics) sessionStarted(kind sessionKind) {
+	m.activeSessions.WithLabelValues(string(kind)).Inc()
+}
+
+func (m *feedMetrics) sessionEnded(kind sessionKind) {
+	m.activeSessions.WithLabelValues(string(kind)).Dec()
 }

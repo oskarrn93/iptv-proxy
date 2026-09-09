@@ -208,6 +208,33 @@ func TestHandleStream_CannotReachAnotherHost(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
+// TestHandleStream_ExposesActiveSessionsByKind checks that a completed
+// /stream request is reflected in the activeSessions gauge under the right
+// "kind" label — live for a channel prefix, vod for a movie/series one — and
+// that the gauge is back at 0 once the request has finished, since the
+// increment/decrement brackets the whole handler (see handleStream).
+func TestHandleStream_ExposesActiveSessionsByKind(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp2t")
+		_, _ = w.Write([]byte{0x47})
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream.URL+"/get.php")
+
+	p.handleStream(httptest.NewRecorder(), streamRequest("live", "alice", "secret", "1.ts"))
+	p.handleStream(httptest.NewRecorder(), streamRequest("movie", "alice", "secret", "1.mkv"))
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	p.Mux().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	assert.Contains(t, body, `iptv_proxy_active_sessions{feed="test",kind="live"} 0`)
+	assert.Contains(t, body, `iptv_proxy_active_sessions{feed="test",kind="vod"} 0`)
+}
+
 func TestHandlePlaylist_ForwardsUpstreamErrorStatus(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
