@@ -88,6 +88,10 @@ func firstForwarded(v string) string {
 	return strings.TrimSpace(first)
 }
 
+// boolPtr returns a pointer to b, for building a *bool config field (e.g.
+// ClientBufferConfig.Enabled) inline where Go doesn't allow &false directly.
+func boolPtr(b bool) *bool { return &b }
+
 // lowercaseAll lowercases each string in ss, so a case-insensitive prefix
 // list only needs its comparisons done once at config-load time rather than
 // once per playlist line.

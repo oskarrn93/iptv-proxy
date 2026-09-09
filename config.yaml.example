@@ -16,6 +16,15 @@
 # has no Xtream login to proxy.
 listen_addr: ":58033"
 
+# client_buffer smooths live TS playback by holding every byte read from
+# upstream for `duration` before it's written to the client, so a brief
+# upstream stall or reconnect that resolves within that window never reaches
+# the client as a stall. Applies to every feed's live streams; omit this
+# whole section to use the default (enabled, 5s).
+client_buffer:
+  enabled: true
+  duration: 5s
+
 # The host rewritten /stream links point back to is auto-detected from each
 # request (Host, or X-Forwarded-Host/-Proto behind a reverse proxy like
 # Traefik) — no public_base_url needs configuring. That also means the same

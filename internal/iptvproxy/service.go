@@ -77,6 +77,12 @@ type feedService struct {
 	repo          *upstreamRepository
 	logger        *slog.Logger
 	metrics       *feedMetrics
+	// clientBufferDelay configures the live-TS delay buffer (see
+	// streamLive/delayedReader): nil disables it, otherwise its value is how
+	// long a byte is held before reaching the client. Proxy-wide
+	// (Config.ClientBuffer), not per-feed, but carried on feedService since
+	// that's what serve/streamLive run on.
+	clientBufferDelay *time.Duration
 	// playlistCache coalesces concurrent requests for this feed's playlist
 	// into a single upstream fetch — a channel list can be tens of megabytes,
 	// and IPTV apps routinely poll it every few seconds from multiple
@@ -118,7 +124,7 @@ type epgFetchResult struct {
 	contentType string
 }
 
-func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logger, metrics *feedMetrics) (*feedService, error) {
+func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logger, metrics *feedMetrics, clientBuffer ClientBufferConfig) (*feedService, error) {
 	target, err := url.Parse(cfg.UpstreamURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid upstream_url: %w", err)
@@ -159,6 +165,11 @@ func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logge
 	// reader to verify the field assignments line up.
 	hide := credentialSwap{from: upstreamCreds, to: cfg.Credentials}
 
+	var clientBufferDelay *time.Duration
+	if clientBuffer.IsEnabled() {
+		clientBufferDelay = &clientBuffer.Duration
+	}
+
 	return &feedService{
 		name:                 cfg.Name,
 		target:               target,
@@ -173,6 +184,7 @@ func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logge
 		metrics:              metrics,
 		playlistCache:        newSingleflightCache[playlistFetchResult](playlistCacheTTL, playlistGroupKey),
 		epgCache:             newSingleflightCache[epgFetchResult](epgCacheTTL, epgGroupKey),
+		clientBufferDelay:    clientBufferDelay,
 	}, nil
 }
 
@@ -743,7 +755,7 @@ func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHe
 	w.WriteHeader(resp.StatusCode)
 
 	if live {
-		if err := s.streamWithReconnect(reqCtx, w, target, readCloserWrapper{Reader: buf, Closer: resp.Body}); err != nil {
+		if err := s.streamLive(reqCtx, w, target, readCloserWrapper{Reader: buf, Closer: resp.Body}); err != nil {
 			// context.Canceled here means the viewer stopped playback (client
 			// closed the connection), not that the upstream or reconnect logic
 			// failed — logging it as an error would page/alert on normal

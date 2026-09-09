@@ -35,7 +35,7 @@ func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, er
 			gatherers = append(gatherers, metrics.registry)
 		}
 		repo := newUpstreamRepository(feedLogger, feedCfg.Timeout)
-		svc, err := newFeedService(feedCfg, repo, feedLogger, metrics)
+		svc, err := newFeedService(feedCfg, repo, feedLogger, metrics, cfg.ClientBuffer)
 		if err != nil {
 			return nil, fmt.Errorf("feed %q: %w", feedCfg.Name, err)
 		}

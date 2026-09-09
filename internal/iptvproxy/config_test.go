@@ -141,6 +141,39 @@ feeds:
 	}
 }
 
+func TestLoadConfig_ClientBufferDefaults(t *testing.T) {
+	path := writeConfig(t, `
+listen_addr: ":58033"
+feeds:
+  - name: feed1
+    upstream_url: "http://example.com"
+    username: u
+    password: p
+`)
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.ClientBuffer.IsEnabled())
+	assert.Equal(t, defaultClientBufferDuration, cfg.ClientBuffer.Duration)
+}
+
+func TestLoadConfig_ClientBufferExplicit(t *testing.T) {
+	path := writeConfig(t, `
+listen_addr: ":58033"
+client_buffer:
+  enabled: false
+  duration: 8s
+feeds:
+  - name: feed1
+    upstream_url: "http://example.com"
+    username: u
+    password: p
+`)
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.ClientBuffer.IsEnabled())
+	assert.Equal(t, 8*time.Second, cfg.ClientBuffer.Duration)
+}
+
 func TestLoadConfig_DuplicateUsername(t *testing.T) {
 	path := writeConfig(t, `
 listen_addr: ":58033"

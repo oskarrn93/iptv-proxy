@@ -23,6 +23,37 @@ type Config struct {
 	// unique=Username names the Go field promoted from the embedded
 	// Credentials, which is what tells two feeds apart on the shared port.
 	Feeds []FeedConfig `yaml:"feeds" validate:"min=1,unique=Username,dive"`
+	// ClientBuffer configures the live-TS smoothing delay applied across
+	// every feed (see ClientBufferConfig) — a proxy-wide setting rather than
+	// a per-feed one, since it's about the client's playback experience, not
+	// any one upstream's behavior.
+	ClientBuffer ClientBufferConfig `yaml:"client_buffer"`
+}
+
+// defaultClientBufferDuration is how long a live TS stream is held back from
+// the client when client_buffer.enabled is true and no duration is
+// configured — long enough to absorb a brief upstream stall or reconnect
+// without the client seeing one, short enough not to noticeably delay
+// channel changes.
+const defaultClientBufferDuration = 5 * time.Second
+
+// ClientBufferConfig controls the delay buffer that smooths live TS
+// streaming (see feedService.streamLive / delayedReader): every byte read
+// from upstream is held for Duration before being written to the client,
+// so a transient upstream hiccup or reconnect that resolves within that
+// window never reaches the client as a stall. Enabled is a pointer so
+// omitting client_buffer entirely from config.yaml is distinguishable from
+// explicitly writing "enabled: false" — the former defaults to on.
+type ClientBufferConfig struct {
+	Enabled  *bool         `yaml:"enabled"`
+	Duration time.Duration `yaml:"duration"`
+}
+
+// IsEnabled reports whether the client buffer should be applied, treating an
+// unset Enabled (config omitted client_buffer, or omitted just its enabled
+// key) as on by default.
+func (c ClientBufferConfig) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
 }
 
 type FeedConfig struct {
@@ -79,6 +110,10 @@ func LoadConfig(path string) (*Config, error) {
 		if cfg.Feeds[i].Timeout <= 0 {
 			cfg.Feeds[i].Timeout = 15 * time.Second
 		}
+	}
+
+	if cfg.ClientBuffer.Duration <= 0 {
+		cfg.ClientBuffer.Duration = defaultClientBufferDuration
 	}
 
 	return &cfg, nil

@@ -28,10 +28,16 @@ func testFeedConfig(upstream string) FeedConfig {
 	}
 }
 
+// disabledClientBuffer is what every test builds its feedService with unless
+// it's specifically exercising the delay buffer — most tests assert on
+// timing or exact byte sequences that a several-second delay would make slow
+// or awkward to express.
+var disabledClientBuffer = ClientBufferConfig{Enabled: boolPtr(false)}
+
 // buildService constructs a feedService from cfg, wiring up the repository,
 // logger, and metrics every caller would otherwise spell out identically.
 func buildService(cfg FeedConfig) (*feedService, error) {
-	return newFeedService(cfg, newUpstreamRepository(testLogger(), cfg.Timeout), testLogger(), newFeedMetrics(cfg.Name, true, testLogger()))
+	return newFeedService(cfg, newUpstreamRepository(testLogger(), cfg.Timeout), testLogger(), newFeedMetrics(cfg.Name, true, testLogger()), disabledClientBuffer)
 }
 
 func newServiceFor(t *testing.T, cfg FeedConfig) *feedService {
