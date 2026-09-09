@@ -4,9 +4,11 @@ This file provides guidance to Claude Code when working with code in this direct
 
 ## What this is
 
-`iptv-proxy` hosts multiple upstream M3U8/Xtream IPTV feeds behind unguessable per-feed credentials, all sharing one listen address/port. A request's own HTTP Basic username/password (not which port it hit) picks which feed's upstream serves it. It rewrites every playlist/segment URL in the upstream M3U8 so the real upstream (and any Xtream credentials embedded in it) never reach the client.
+`iptv-proxy` hosts multiple upstream M3U8/Xtream IPTV feeds behind unguessable per-feed credentials, all sharing one listen address/port. A request's own HTTP Basic username/password (not which port it hit) picks which feed's upstream serves it. It rewrites every playlist/segment URL in the upstream M3U8 so the real upstream (and any Xtream credentials embedded in it) never reach the client. It also proxies the Xtream Codes JSON API (`player_api.php`/`panel_api.php`) itself, not just the M3U playlist — see "Xtream Codes API proxying" below.
 
 Go module: `github.com/oskarrn93/media-services/iptv-proxy` (Go 1.27). Part of the `media-services` homelab stack — see `../.claude/CLAUDE.md` for the compose/VPN/Traefik context this service runs inside (it's one of the `iptv-proxy-{1..4}` services network-namespaced through `vpn`).
+
+For the shape of the Xtream Codes API this proxy forwards (actions, request/response fields), the `xtream_code_client` Dart package's docs are a useful reference even though this codebase isn't Dart: https://pub.dev/documentation/xtream_code_client/latest/ — it documents `player_api.php` actions (`get_live_categories`, `get_live_streams`, `get_vod_categories`, `get_vod_streams`, `get_series`, `get_series_info`, `get_vod_info`, and the bare-query `authenticate`/login call returning `user_info`/`server_info`), the `get.php` M3U playlist endpoint, and `xmltv.php` EPG endpoints.
 
 ## HLS/M3U8 protocol compliance
 
@@ -42,3 +44,18 @@ go vet ./...
 - Playlist cache (`cachedPlaylist`/`storePlaylistCache`) exists as both a concurrent-viewer optimization and a stale-fallback source if the upstream fetch fails — preserve stale-fallback behavior when changing fetch logic.
 - `/epg` (`handleEPG` in `handler.go`, `feedService.serveEPG`/`fetchEPG`/`epgTarget` in `service.go`) proxies the matched feed's XMLTV guide from its upstream's `/xmltv.php` (same host as `upstream_url`, upstream's own credentials as query params — see `epgTarget`), cached for `epgCacheTTL` (12h, much longer than `playlistCacheTTL` since a guide changes far less often) with the same cache-then-singleflight-coalesce shape as the playlist route. Unlike a playlist, the XMLTV body is opaque to this proxy — nothing in it is a stream URL, so it's cached and served byte-for-byte with no rewriting.
 - Rewritten `/stream` links carry `baseURLPlaceholder` (a sentinel, not a real host) instead of a configured `public_base_url` — there is no such config. The cached/rewritten playlist body is host-agnostic; `applyBaseURL` substitutes in the actual `scheme://host` per request (from `requestBaseURL`: `X-Forwarded-Host`/`X-Forwarded-Proto` if present, else `Host`/TLS) in `writePlaylistResponse`. This is what lets one cached playlist serve correct absolute links to clients reaching the proxy through different hostnames (LAN vs. external) without re-fetching or re-rewriting per host.
+
+## Xtream Codes API proxying
+
+`/player_api.php` and its `/panel_api.php` alias (`handleXtreamAPI` in `handler.go`, `feedService.serveXtreamAPI`/`xtreamAPITarget`/`rewriteXtreamAPIBody` in `xtream.go`) let an Xtream Codes IPTV app log in and browse categories/streams/VOD/series against this proxy exactly as it would against the real upstream, on top of the same feeds the M3U routes already serve — there is no separate `protocol:` config field. A feed's Xtream upstream login is inferred from `upstream_url` the same way the M3U routes already do: `s.target` (scheme/host) plus `s.upstreamCreds` (username/password parsed from `upstream_url`'s own query params via `credentialsFromURL`).
+
+Key behaviors to preserve when touching `xtream.go`:
+
+- Unlike `/playlist.m3u8`/`/epg`, this route is **not cached**: a `player_api.php` request carries arbitrary query params (`action`, `category_id`, `vod_id`, `series_id`, ...), so there's no single stable target to coalesce concurrent requests onto the way `servePlaylist`/`serveEPG` do for their one fixed upstream URL. Every request is a fresh upstream fetch.
+- `xtreamAPITarget` reuses `s.restoreCredentials` (the same swap `streamTarget` uses to put the upstream's credentials back) to turn the client's own query string into the upstream's — so the credential-matching semantics for a `player_api.php` request are exactly the same as for a rewritten stream link, not a second implementation of the same idea.
+- The JSON response is walked recursively (`rewriteXtreamValue`) and rewritten in three ways — extend this walk, don't bypass it, when a new field needs rewriting:
+  - a nested `user_info` object's `username`/`password` (matched by key name, not by response shape/action) are swapped from the upstream's real pair back to this feed's own, via `rewriteUserInfo`.
+  - a nested `server_info` object's `url`/`port`/`https_port`/`server_protocol` are pointed at this proxy (via `rewriteServerInfo`, using the same `requestBaseURL`-derived `baseURL` as the playlist route) rather than the upstream, so a client that builds its own stream URLs from `server_info` instead of using links this proxy already rewrote still reaches back through this proxy.
+  - any string leaf that parses as an absolute URL on this feed's own upstream host (e.g. a VOD/series entry's `direct_source`) is rewritten through `writeStreamURI` — the identical `/<prefix>/<username>/<password>/<file>` link shape a playlist entry gets — via `rewriteXtreamURLString`.
+- A response body that fails to parse as JSON (an upstream error page, a misconfigured upstream) is passed through unrewritten rather than dropped — see `rewriteXtreamAPIBody`'s fallback.
+- `maxXtreamAPIBody` caps how much of a response this proxy will buffer to `json.Unmarshal` — unlike the playlist/stream routes, which stream line-by-line or copy bytes without holding the whole body, rewriting JSON structurally requires the full body in memory first.

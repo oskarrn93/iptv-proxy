@@ -15,9 +15,10 @@ import (
 type route string
 
 const (
-	routePlaylist route = "playlist"
-	routeStream   route = "stream"
-	routeEPG      route = "epg"
+	routePlaylist  route = "playlist"
+	routeStream    route = "stream"
+	routeEPG       route = "epg"
+	routeXtreamAPI route = "xtream_api"
 )
 
 // errorKind identifies why an upstream request failed, used as the "kind"

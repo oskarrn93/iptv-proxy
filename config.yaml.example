@@ -1,8 +1,19 @@
 # Copy to config.yaml (gitignored) and fill in real values.
 # All feeds share this one listen address/port; a request's own
 # username/password (query params or HTTP Basic Auth) picks which feed's
-# upstream serves it. Point IPTV apps at:
-#   http://<host>:<listen_port>/playlist.m3u8?username=<username>&password=<password>
+# upstream serves it. Point IPTV apps at either, whichever the app expects —
+# both are served by the same feed and credentials, no separate config:
+#   M3U:     http://<host>:<listen_port>/playlist.m3u8?username=<username>&password=<password>
+#   Xtream:  http://<host>:<listen_port> as the "server", <username>/<password> as the login
+#            (the app itself calls /player_api.php, /panel_api.php, and the
+#            standard Xtream stream paths against that)
+#
+# Xtream API support requires upstream_url to be an Xtream get.php URL with
+# its own username/password query params (as below) — that pair is also what
+# this proxy uses as the upstream's Xtream login for player_api.php/panel_api.php
+# calls and for the standard Xtream stream/EPG paths. A feed whose upstream is
+# a plain M3U playlist with no such params still works for the M3U routes, but
+# has no Xtream login to proxy.
 listen_addr: ":58033"
 
 # The host rewritten /stream links point back to is auto-detected from each

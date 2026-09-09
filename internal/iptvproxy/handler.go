@@ -58,6 +58,8 @@ func (p *Proxy) Mux() *http.ServeMux {
 	mux.HandleFunc("/playlist.m3u8", p.withRequestLogger(p.handlePlaylist))
 	mux.HandleFunc("/", p.withRequestLogger(p.handlePlaylist))
 	mux.HandleFunc("/epg", p.withRequestLogger(p.handleEPG))
+	mux.HandleFunc("/player_api.php", p.withRequestLogger(p.handleXtreamAPI))
+	mux.HandleFunc("/panel_api.php", p.withRequestLogger(p.handleXtreamAPI))
 	mux.HandleFunc("/{prefix}/{username}/{password}/{rest...}", p.withRequestLogger(p.handleStream))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, max-age=0")
@@ -200,6 +202,24 @@ func (p *Proxy) handleEPG(w http.ResponseWriter, r *http.Request) {
 		loggerFromContext(r.Context(), f.logger).InfoContext(r.Context(), "epg request",
 			"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr, "host", requestHost(r))
 		f.serveEPG(r.Context(), w)
+	})
+}
+
+// handleXtreamAPI serves the matched feed's player_api.php (or its
+// panel_api.php alias) — same credential resolution as handlePlaylist/
+// handleEPG, so an Xtream Codes app pointed at this proxy with this feed's
+// credentials can log in and browse categories/streams/VOD/series exactly as
+// it would against the real upstream, without ever seeing the upstream's own
+// host or credentials.
+func (p *Proxy) handleXtreamAPI(w http.ResponseWriter, r *http.Request) {
+	f := p.authenticate(w, r)
+	if f == nil {
+		return
+	}
+	f.instrument(routeXtreamAPI, requestHost(r), w, func(w http.ResponseWriter) {
+		loggerFromContext(r.Context(), f.logger).InfoContext(r.Context(), "xtream api request",
+			"method", r.Method, "path", r.URL.Path, "action", r.URL.Query().Get("action"), "remote_addr", r.RemoteAddr, "host", requestHost(r))
+		f.serveXtreamAPI(r.Context(), w, r.Header, r.URL.RawQuery, requestBaseURL(r))
 	})
 }
 
