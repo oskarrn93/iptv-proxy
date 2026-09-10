@@ -3,7 +3,6 @@ package iptvproxy
 import (
 	"context"
 	"io"
-	"strings"
 	"testing"
 	"time"
 
@@ -11,17 +10,46 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDelayedReader_HoldsDataForDelay(t *testing.T) {
-	src := strings.NewReader("hello world")
-	dr := newDelayedReader(context.Background(), src, 100*time.Millisecond)
+// The delay ramps from ~0 up to the configured delay over the first delay's
+// worth of wall-clock time (see delayedReader's doc comment), so a chunk
+// read right at the start of the stream should come back almost
+// immediately, not held for the full configured delay.
+func TestDelayedReader_RampsUpDelayFromNearZero(t *testing.T) {
+	pr, pw := io.Pipe()
+	dr := newDelayedReader(context.Background(), pr, 200*time.Millisecond)
+	go pw.Write([]byte("first"))
 
 	start := time.Now()
-	out, err := io.ReadAll(dr)
+	buf := make([]byte, len("first"))
+	_, err := io.ReadFull(dr, buf)
 	elapsed := time.Since(start)
 
 	require.NoError(t, err)
-	assert.Equal(t, "hello world", string(out))
-	assert.GreaterOrEqual(t, elapsed, 90*time.Millisecond, "first byte should be held back for roughly the configured delay")
+	assert.Equal(t, "first", string(buf))
+	assert.Less(t, elapsed, 100*time.Millisecond, "a chunk read right after start should ramp toward ~0 delay, not the full configured delay")
+}
+
+// Once the ramp period has fully elapsed, later chunks should be held for
+// the full configured delay.
+func TestDelayedReader_HoldsFullDelayAfterRampUp(t *testing.T) {
+	delay := 100 * time.Millisecond
+	pr, pw := io.Pipe()
+	dr := newDelayedReader(context.Background(), pr, delay)
+
+	writtenAt := make(chan time.Time, 1)
+	go func() {
+		time.Sleep(delay + 50*time.Millisecond) // let the ramp fully elapse first
+		writtenAt <- time.Now()
+		pw.Write([]byte("late"))
+	}()
+
+	buf := make([]byte, len("late"))
+	_, err := io.ReadFull(dr, buf)
+	elapsed := time.Since(<-writtenAt)
+
+	require.NoError(t, err)
+	assert.Equal(t, "late", string(buf))
+	assert.GreaterOrEqual(t, elapsed, 90*time.Millisecond, "a chunk read after the ramp period should be held for the full configured delay")
 }
 
 func TestDelayedReader_PropagatesUpstreamError(t *testing.T) {

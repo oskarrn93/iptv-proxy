@@ -3,10 +3,37 @@ package iptvproxy
 import (
 	"context"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"time"
 )
+
+const (
+	// maxSupportedBitrateBytesPerSec is the highest sustained upstream
+	// bitrate the delay buffer's channel is sized to hold for a full delay
+	// window without the producer stalling on a channel send — well above
+	// even a high-bitrate 4K feed, with headroom.
+	maxSupportedBitrateBytesPerSec = 100_000_000 / 8 // 100 Mbps
+
+	// minDelayChunks floors channel capacity for very short delays, where
+	// bitrate*delay alone would undersize it relative to bufferedCopy's own
+	// chunk-at-a-time pacing.
+	minDelayChunks = 256
+)
+
+// delayBufferChunkCapacity sizes the delayedReader's channel so it can hold
+// a full `delay` window of chunks at maxSupportedBitrateBytesPerSec without
+// pump's channel send blocking before Read's own elapsed-time check does —
+// see newDelayedReader. A fixed chunk count (the previous behavior) sized
+// for typical bitrates fills up well before `delay` elapses on a high-bitrate
+// 4K stream, at which point pump blocks on the channel send and stalls reads
+// from the real upstream connection — the exact kind of stall the buffer
+// exists to smooth over.
+func delayBufferChunkCapacity(delay time.Duration) int {
+	needed := int(math.Ceil(delay.Seconds() * maxSupportedBitrateBytesPerSec / bufferSize))
+	return max(needed, minDelayChunks)
+}
 
 // delayChunk is one read from the upstream side of a delayedReader, tagged
 // with when it was read so Read can hold it until bufferDuration has
@@ -41,13 +68,8 @@ type delayedReader struct {
 
 func newDelayedReader(ctx context.Context, src io.Reader, delay time.Duration) *delayedReader {
 	dr := &delayedReader{
-		ctx: ctx,
-		// Buffered generously enough that a fast producer doesn't stall on
-		// channel sends between the (rare) Read calls that drain it — actual
-		// memory use is bounded by delay * upstream bitrate regardless, since
-		// production can only run delay ahead of consumption before Read
-		// starts blocking on the elapsed-time check anyway.
-		chunks: make(chan delayChunk, 256),
+		ctx:    ctx,
+		chunks: make(chan delayChunk, delayBufferChunkCapacity(delay)),
 		delay:  delay,
 		start:  time.Now(),
 	}
