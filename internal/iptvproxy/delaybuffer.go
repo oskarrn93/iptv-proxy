@@ -19,15 +19,21 @@ type delayChunk struct {
 	at   time.Time
 }
 
-// delayedReader wraps src so every byte read from it is held for delay
-// before Read returns it. Reading continues from src in the background the
-// whole time, so once warmed up the reader always has roughly delay's worth
-// of data already sitting in chunks — a stall in src of up to delay is
-// invisible to whatever is reading from the delayedReader, at the cost of
-// adding that same delay before the first byte comes out.
+// delayedReader wraps src so every byte read from it is held back before
+// Read returns it, by an amount that ramps from ~0 up to delay over the
+// first delay's worth of wall-clock time (see the elapsed/effectiveDelay
+// calculation in Read), then holds steady at delay. Reading continues from
+// src in the background the whole time. This trades full stall protection
+// during that initial ramp for a near-immediate first byte: a chunk read a
+// duration `a` after streaming started is held for only min(a, delay), so
+// early on there's little or no reserve banked yet and an upstream hiccup in
+// those first few seconds can still reach the client, but by the time `a`
+// reaches delay the reader has caught up to the same full-delay protection
+// as before, and stays there for the rest of the stream.
 type delayedReader struct {
 	ctx    context.Context
 	delay  time.Duration
+	start  time.Time
 	chunks chan delayChunk
 	buf    []byte
 	err    error
@@ -43,6 +49,7 @@ func newDelayedReader(ctx context.Context, src io.Reader, delay time.Duration) *
 		// starts blocking on the elapsed-time check anyway.
 		chunks: make(chan delayChunk, 256),
 		delay:  delay,
+		start:  time.Now(),
 	}
 	go dr.pump(src)
 	return dr
@@ -92,7 +99,15 @@ func (dr *delayedReader) Read(p []byte) (int, error) {
 		if !ok {
 			return 0, io.EOF
 		}
-		if wait := time.Until(chunk.at.Add(dr.delay)); wait > 0 {
+		// Ramp the held-back amount from 0 up to dr.delay over the first
+		// dr.delay of wall-clock time since streaming started, rather than
+		// applying the full delay from the very first chunk — see the
+		// delayedReader doc comment.
+		effectiveDelay := dr.delay
+		if elapsed := chunk.at.Sub(dr.start); elapsed < dr.delay {
+			effectiveDelay = elapsed
+		}
+		if wait := time.Until(chunk.at.Add(effectiveDelay)); wait > 0 {
 			timer := time.NewTimer(wait)
 			select {
 			case <-timer.C:

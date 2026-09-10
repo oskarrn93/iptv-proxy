@@ -38,12 +38,15 @@ type Config struct {
 const defaultClientBufferDuration = 5 * time.Second
 
 // ClientBufferConfig controls the delay buffer that smooths live TS
-// streaming (see feedService.streamLive / delayedReader): every byte read
-// from upstream is held for Duration before being written to the client,
-// so a transient upstream hiccup or reconnect that resolves within that
-// window never reaches the client as a stall. Enabled is a pointer so
-// omitting client_buffer entirely from config.yaml is distinguishable from
-// explicitly writing "enabled: false" — the former defaults to on.
+// streaming (see feedService.streamLive / delayedReader): bytes read from
+// upstream are held back before being written to the client, ramping from
+// no delay up to the full Duration over the first Duration of playback, so
+// a transient upstream hiccup or reconnect that resolves within the
+// (ramped) held-back window never reaches the client as a stall, without
+// making the client wait the full Duration before the stream starts.
+// Enabled is a pointer so omitting client_buffer entirely from config.yaml
+// is distinguishable from explicitly writing "enabled: false" — the former
+// defaults to on.
 type ClientBufferConfig struct {
 	Enabled  *bool         `yaml:"enabled"`
 	Duration time.Duration `yaml:"duration"`
