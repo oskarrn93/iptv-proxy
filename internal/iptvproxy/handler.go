@@ -1,9 +1,14 @@
 package iptvproxy
 
 import (
+	"crypto/subtle"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -19,10 +24,18 @@ type Proxy struct {
 	feeds          []*feedService
 	logger         *slog.Logger
 	metricsHandler http.Handler
+	// shares holds every currently-valid temporary share link (see
+	// handleShare/handleCreateShare). Always built, even with AdminToken
+	// unset — handleShare still needs somewhere to look tokens up, and an
+	// empty store just serves 404s.
+	shares *shareStore
+	// adminToken guards handleCreateShare; empty means the admin endpoint is
+	// disabled (see Config.AdminToken).
+	adminToken string
 }
 
 func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, error) {
-	p := &Proxy{logger: logger}
+	p := &Proxy{logger: logger, shares: newShareStore(), adminToken: cfg.AdminToken}
 
 	// Gatherers merges every feed's own registry into one /metrics response
 	// without the feeds sharing a registry outright — each newFeedMetrics
@@ -60,6 +73,8 @@ func (p *Proxy) Mux() *http.ServeMux {
 	mux.HandleFunc("/epg", p.withRequestLogger(p.handleEPG))
 	mux.HandleFunc("/player_api.php", p.withRequestLogger(p.handleXtreamAPI))
 	mux.HandleFunc("/panel_api.php", p.withRequestLogger(p.handleXtreamAPI))
+	mux.HandleFunc("/share/{token}", p.withRequestLogger(p.handleShare))
+	mux.HandleFunc("POST /admin/shares", p.withRequestLogger(p.handleCreateShare))
 	mux.HandleFunc("/{prefix}/{username}/{password}/{rest...}", p.withRequestLogger(p.handleStream))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, max-age=0")
@@ -250,5 +265,136 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	f.instrument(routeStream, requestHost(r), w, func(w http.ResponseWriter) {
 		f.serve(r.Context(), w, r.Header, target, requestBaseURL(r))
+	})
+}
+
+// handleShare serves a temporary, token-scoped share created by
+// handleCreateShare. A share carries no feed credentials of its own — token
+// possession plus not-yet-expired is the whole auth check — so an expired or
+// unknown token gets the same 404 as one that never existed, and a nested
+// playlist URI (see shareURIWriter) is only ever followed back onto the same
+// upstream host the share was created against, never an arbitrary one a
+// client supplies.
+func (p *Proxy) handleShare(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	sh, ok := p.shares.lookup(token)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	target := sh.target
+	if raw := r.URL.Query().Get("u"); raw != "" {
+		u, err := url.Parse(raw)
+		if err != nil || !u.IsAbs() || u.Host != sh.target.Host {
+			http.Error(w, "bad u param", http.StatusBadRequest)
+			return
+		}
+		target = u
+	}
+
+	sh.feed.metrics.sessionStarted(sh.kind)
+	defer sh.feed.metrics.sessionEnded(sh.kind)
+
+	sh.feed.instrument(routeShare, requestHost(r), w, func(w http.ResponseWriter) {
+		loggerFromContext(r.Context(), sh.feed.logger).InfoContext(r.Context(), "share request",
+			"feed", sh.feed.name, "method", r.Method, "remote_addr", r.RemoteAddr, "host", requestHost(r))
+		sh.feed.serveWith(r.Context(), w, r.Header, target, requestBaseURL(r), shareURIWriter(token))
+	})
+}
+
+// maxCreateShareBody bounds how much of an /admin/shares request body this
+// proxy will buffer — the request is a few short JSON fields, never anything
+// approaching the size of a playlist or segment.
+const maxCreateShareBody = 4 << 10
+
+// createShareRequest is the POST /admin/shares JSON body: which feed to
+// share from, the exact channel link a client already uses against that
+// feed (see parseChannelPath), and how long the resulting share stays valid.
+type createShareRequest struct {
+	Feed       string `json:"feed"`
+	ChannelURL string `json:"channel_url"`
+	TTL        string `json:"ttl"`
+}
+
+// authenticateAdmin reports whether r carries this proxy's configured admin
+// token as a Bearer credential. An unset adminToken always fails closed —
+// see Config.AdminToken.
+func (p *Proxy) authenticateAdmin(r *http.Request) bool {
+	if p.adminToken == "" {
+		return false
+	}
+	bearer, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(bearer), []byte(p.adminToken)) == 1
+}
+
+// handleCreateShare mints a temporary share for one channel of one feed,
+// given the exact channel URL a client already uses against that feed (the
+// admin token is this endpoint's only auth — see authenticateAdmin — a
+// share itself carries none). It resolves req.ChannelURL back to the real
+// upstream URL through the same feed.streamTarget path a normal /stream
+// request would, so a share can never point anywhere a client couldn't
+// already reach with valid feed credentials.
+func (p *Proxy) handleCreateShare(w http.ResponseWriter, r *http.Request) {
+	logger := loggerFromContext(r.Context(), p.logger)
+
+	if !p.authenticateAdmin(r) {
+		logger.WarnContext(r.Context(), "admin auth failed", "remote_addr", r.RemoteAddr, "host", requestHost(r))
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req createShareRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxCreateShareBody)).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	var feed *feedService
+	for _, f := range p.feeds {
+		if f.name == req.Feed {
+			feed = f
+			break
+		}
+	}
+	if feed == nil {
+		http.Error(w, "unknown feed", http.StatusNotFound)
+		return
+	}
+
+	ttl, err := time.ParseDuration(req.TTL)
+	if err != nil || ttl <= 0 {
+		http.Error(w, "ttl must be a positive duration (e.g. \"4h\")", http.StatusBadRequest)
+		return
+	}
+
+	channelURL, err := url.Parse(req.ChannelURL)
+	if err != nil || !channelURL.IsAbs() {
+		http.Error(w, "invalid channel_url", http.StatusBadRequest)
+		return
+	}
+	prefix, username, password, rest, ok := parseChannelPath(channelURL.Path)
+	if !ok {
+		http.Error(w, "channel_url is not a recognized stream link", http.StatusBadRequest)
+		return
+	}
+	userOK, passOK := feed.matches(Credentials{Username: username, Password: password})
+	if !userOK || !passOK {
+		http.Error(w, "channel_url credentials do not match feed", http.StatusBadRequest)
+		return
+	}
+
+	target := feed.streamTarget(prefix, rest, channelURL.RawQuery)
+	token, expiresAt := p.shares.create(feed, target, classifySessionKind(prefix), ttl)
+
+	logger.InfoContext(r.Context(), "share created", "feed", feed.name, "kind", classifySessionKind(prefix), "expires_at", expiresAt)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"url":        requestBaseURL(r) + "/share/" + token,
+		"expires_at": expiresAt.Format(time.RFC3339),
 	})
 }

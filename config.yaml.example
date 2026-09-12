@@ -25,6 +25,19 @@ client_buffer:
   enabled: true
   duration: 5s
 
+# admin_token guards POST /admin/shares, which mints a temporary,
+# unguessable link (GET /share/<token>) to a single channel of a single feed
+# — for sending one stream to someone without handing out real feed
+# credentials. Omit to leave the admin endpoint disabled entirely.
+#
+#   curl -X POST http://<host>:<listen_port>/admin/shares \
+#     -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+#     -d '{"feed":"feed-1","channel_url":"http://<host>:<listen_port>/live/proxyuser1/proxypass1/12345.ts","ttl":"4h"}'
+#
+# See docker-compose.yml for why this should only ever be reachable on the
+# LAN entrypoint, even though the rest of this proxy is public.
+admin_token: "CHANGE_ME_ADMIN_TOKEN"
+
 # The host rewritten /stream links point back to is auto-detected from each
 # request (Host, or X-Forwarded-Host/-Proto behind a reverse proxy like
 # Traefik) — no public_base_url needs configuring. That also means the same

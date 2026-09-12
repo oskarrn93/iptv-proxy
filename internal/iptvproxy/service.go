@@ -257,16 +257,22 @@ func (s *feedService) excludeEntry(extinfLine string) bool {
 	return false
 }
 
+// uriWriter writes the link that stands in for one resolved upstream URI into
+// a playlist being rewritten. writeStreamURI is the default (Xtream-shaped
+// feed links); serveShare passes shareURIWriter instead, so the same rewrite
+// pass can back either a normal /stream link or a token-scoped /share one
+// without duplicating rewritePlaylist/rewriteAttrURI/serve for the latter.
+type uriWriter func(out *strings.Builder, resolved *url.URL)
+
 // rewritePlaylist rewrites every segment/sub-playlist/EXT-X-KEY/EXT-X-MAP URI
-// in the playlist into a link back through this feed's own /stream endpoint,
-// carrying this feed's credentials in place of the upstream's (see
-// writeStreamURI) — so neither the upstream host nor the credentials it embeds
-// reach the client. It also drops any #EXTINF entry (and its following URI
-// line) whose group-title matches excludeGroupPrefixes.
+// in the playlist into a link back through this proxy (see writeURI) — so
+// neither the upstream host nor the credentials it embeds reach the client.
+// It also drops any #EXTINF entry (and its following URI line) whose
+// group-title matches excludeGroupPrefixes.
 // The reader is consumed strictly line by line, so a full channel list never
 // has to be held as one []byte — sizeHint is the upstream's Content-Length, or
 // <= 0 when it arrived chunked.
-func (s *feedService) rewritePlaylist(r io.Reader, srcURL *url.URL, sizeHint int64) (string, error) {
+func (s *feedService) rewritePlaylist(r io.Reader, srcURL *url.URL, sizeHint int64, writeURI uriWriter) (string, error) {
 	scanner := bufio.NewScanner(r)
 	// Open at 64 KB and let the scanner grow only if a line really needs it; the
 	// 1 MB is the safety cap, not the opening allocation.
@@ -303,7 +309,7 @@ func (s *feedService) rewritePlaylist(r io.Reader, srcURL *url.URL, sizeHint int
 			skipURI = false
 			out.WriteString(line)
 		case strings.HasPrefix(trimmed, "#EXT-X-KEY") || strings.HasPrefix(trimmed, "#EXT-X-MAP"):
-			out.WriteString(s.rewriteAttrURI(trimmed, srcURL))
+			out.WriteString(rewriteAttrURI(trimmed, srcURL, writeURI))
 		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
 			out.WriteString(line)
 		default:
@@ -316,7 +322,7 @@ func (s *feedService) rewritePlaylist(r io.Reader, srcURL *url.URL, sizeHint int
 				out.WriteString(line)
 				break
 			}
-			s.writeStreamURI(&out, resolved)
+			writeURI(&out, resolved)
 		}
 		out.WriteByte('\n')
 	}
@@ -485,7 +491,7 @@ var attrURIPattern = regexp.MustCompile(`(?i)URI=(?:"[^"]*"|'[^']*')`)
 // #EXT-X-MAP line. ReplaceAllStringFunc scans the original line left to right
 // and never re-examines what it substitutes in, so a replacement that itself
 // begins with `URI=` cannot be re-wrapped.
-func (s *feedService) rewriteAttrURI(line string, base *url.URL) string {
+func rewriteAttrURI(line string, base *url.URL, writeURI uriWriter) string {
 	return attrURIPattern.ReplaceAllStringFunc(line, func(match string) string {
 		// match is `URI=` + delimiter + value + the same delimiter.
 		delim := match[len("URI=")]
@@ -497,7 +503,7 @@ func (s *feedService) rewriteAttrURI(line string, base *url.URL) string {
 		var out strings.Builder
 		out.WriteString("URI=")
 		out.WriteByte(delim)
-		s.writeStreamURI(&out, resolved)
+		writeURI(&out, resolved)
 		out.WriteByte(delim)
 		return out.String()
 	})
@@ -523,7 +529,7 @@ func (s *feedService) fetchPlaylist(reqHeader http.Header) (playlistFetchResult,
 	if pfErr := s.upstreamStatusFailure(tctx, s.target, resp); pfErr != nil {
 		return playlistFetchResult{}, pfErr
 	}
-	return s.readAndRewrite(tctx, resp.Body, s.target, resp.StatusCode, resp.ContentLength)
+	return s.readAndRewrite(tctx, resp.Body, s.target, resp.StatusCode, resp.ContentLength, s.writeStreamURI)
 }
 
 // upstreamFailure logs a failed upstream fetch, counts it, and returns the
@@ -554,9 +560,9 @@ func (s *feedService) upstreamStatusFailure(ctx context.Context, target *url.URL
 // is the one place that decides how a read or rewrite failure is reported, so
 // the top-level playlist and a sub-playlist reached through /stream — which
 // are the same operation — can't drift apart.
-func (s *feedService) readAndRewrite(ctx context.Context, body io.Reader, target *url.URL, status int, sizeHint int64) (playlistFetchResult, error) {
+func (s *feedService) readAndRewrite(ctx context.Context, body io.Reader, target *url.URL, status int, sizeHint int64, writeURI uriWriter) (playlistFetchResult, error) {
 	logger := loggerFromContext(ctx, s.logger)
-	rewritten, err := s.rewritePlaylist(body, target, sizeHint)
+	rewritten, err := s.rewritePlaylist(body, target, sizeHint, writeURI)
 	if err != nil {
 		// Scanning is the only thing that can fail here, and it fails only on
 		// a bad read of the upstream body — hence 502 rather than a 500 for a
@@ -691,8 +697,17 @@ func (s *feedService) servePlaylist(reqCtx context.Context, w http.ResponseWrite
 
 // serve fetches target through the repository and writes the appropriate
 // response to w: a rewritten playlist, a copied VOD segment, or a
-// reconnecting live TS relay.
+// reconnecting live TS relay. Nested playlist URIs are rewritten as normal
+// /stream links (see writeStreamURI).
 func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHeader http.Header, target *url.URL, baseURL string) {
+	s.serveWith(reqCtx, w, reqHeader, target, baseURL, s.writeStreamURI)
+}
+
+// serveWith is serve with the playlist-rewrite link strategy pulled out as a
+// parameter, so serveShare can reuse the exact same fetch/rewrite/live-relay
+// logic while writing nested playlist URIs as /share/<token> links instead of
+// this feed's own /stream ones.
+func (s *feedService) serveWith(reqCtx context.Context, w http.ResponseWriter, reqHeader http.Header, target *url.URL, baseURL string, writeURI uriWriter) {
 	logger := loggerFromContext(reqCtx, s.logger)
 	tctx, cancel := s.upstreamContext(reqCtx, target)
 	defer cancel()
@@ -721,7 +736,7 @@ func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHe
 	peeked, _ := buf.Peek(512)
 
 	if shouldRewritePlaylist(target, contentType, peeked) {
-		result, err := s.readAndRewrite(reqCtx, buf, target, resp.StatusCode, resp.ContentLength)
+		result, err := s.readAndRewrite(reqCtx, buf, target, resp.StatusCode, resp.ContentLength, writeURI)
 		if err != nil {
 			writeUpstreamError(w, err)
 			return

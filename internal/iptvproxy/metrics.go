@@ -19,6 +19,7 @@ const (
 	routeStream    route = "stream"
 	routeEPG       route = "epg"
 	routeXtreamAPI route = "xtream_api"
+	routeShare     route = "share"
 )
 
 // errorKind identifies why an upstream request failed, used as the "kind"

@@ -55,7 +55,7 @@ func newTestService(t *testing.T, upstream string) *feedService {
 // rewriteBody rewrites a playlist held in memory, adapting it to
 // rewritePlaylist's streaming signature.
 func rewriteBody(s *feedService, body []byte, srcURL *url.URL) (string, error) {
-	return s.rewritePlaylist(bytes.NewReader(body), srcURL, int64(len(body)))
+	return s.rewritePlaylist(bytes.NewReader(body), srcURL, int64(len(body)), s.writeStreamURI)
 }
 
 // newCountingPlaylistUpstream serves a fixed playlist and counts how many
@@ -290,7 +290,7 @@ func TestRewriteAttrURI_SingleQuotes(t *testing.T) {
 	base, _ := url.Parse("http://upstream.example.com/live/index.m3u8")
 
 	line := `#EXT-X-KEY:METHOD=AES-128,URI='key.bin'`
-	out := s.rewriteAttrURI(line, base)
+	out := rewriteAttrURI(line, base, s.writeStreamURI)
 	assert.Contains(t, out, "URI='"+baseURLPlaceholder+"/stream/")
 	assert.NotContains(t, out, "upstream.example.com") // raw upstream host never appears
 
