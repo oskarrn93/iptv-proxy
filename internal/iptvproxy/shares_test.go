@@ -14,7 +14,7 @@ func TestShareStore_CreateAndLookup(t *testing.T) {
 	feed := newTestService(t, "http://upstream.example.com/get.php")
 	target, _ := url.Parse("http://upstream.example.com/live/x/y/1.ts")
 
-	token, expiresAt := store.create(feed, target, sessionKindLive, time.Hour)
+	token, expiresAt := store.create(feed, target, sessionKindLive, time.Hour, "Test Channel")
 	require.NotEmpty(t, token)
 	assert.WithinDuration(t, time.Now().Add(time.Hour), expiresAt, time.Second)
 
@@ -36,7 +36,7 @@ func TestShareStore_ExpiredShareIsGone(t *testing.T) {
 	feed := newTestService(t, "http://upstream.example.com/get.php")
 	target, _ := url.Parse("http://upstream.example.com/live/x/y/1.ts")
 
-	token, _ := store.create(feed, target, sessionKindLive, -time.Second)
+	token, _ := store.create(feed, target, sessionKindLive, -time.Second, "Test Channel")
 
 	_, ok := store.lookup(token)
 	assert.False(t, ok, "an already-expired share must not be servable")
@@ -47,7 +47,7 @@ func TestShareStore_CreateCapsAtMaxTTL(t *testing.T) {
 	feed := newTestService(t, "http://upstream.example.com/get.php")
 	target, _ := url.Parse("http://upstream.example.com/live/x/y/1.ts")
 
-	_, expiresAt := store.create(feed, target, sessionKindLive, 365*24*time.Hour)
+	_, expiresAt := store.create(feed, target, sessionKindLive, 365*24*time.Hour, "Test Channel")
 	assert.WithinDuration(t, time.Now().Add(maxShareTTL), expiresAt, time.Second)
 }
 

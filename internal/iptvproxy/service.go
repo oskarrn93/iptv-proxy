@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -94,6 +95,47 @@ type feedService struct {
 	// fetches of the same multi-megabyte XMLTV guide and caching the result
 	// for epgCacheTTL.
 	epgCache *singleflightCache[epgFetchResult]
+	// liveTargets tracks which upstream URLs currently have an open live TS
+	// relay (see serveWith's live branch), so a second concurrent request for
+	// the exact same channel — whether a normal /stream viewer or a /share
+	// link pointing at it — is rejected instead of opening a second upstream
+	// connection and silently burning another of the account's (usually
+	// limited) concurrent-connection slots.
+	liveTargets *liveTargetTracker
+}
+
+// liveTargetTracker records which upstream target URLs currently have an
+// open live TS relay. It exists only for this one-live-stream-per-url
+// guarantee, kept separate from feedMetrics.sessionStarted/sessionEnded
+// (which counts every /stream request, including short segment/playlist
+// fetches) since only the live TS relay actually holds a single upstream
+// connection open for the viewer's whole session.
+type liveTargetTracker struct {
+	mu      sync.Mutex
+	targets map[string]struct{}
+}
+
+func newLiveTargetTracker() *liveTargetTracker {
+	return &liveTargetTracker{targets: make(map[string]struct{})}
+}
+
+// acquire claims target for the caller and reports true, or reports false if
+// another relay already holds it.
+func (t *liveTargetTracker) acquire(target string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, busy := t.targets[target]; busy {
+		return false
+	}
+	t.targets[target] = struct{}{}
+	return true
+}
+
+// release frees target so a later request for the same channel can proceed.
+func (t *liveTargetTracker) release(target string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.targets, target)
 }
 
 // playlistFetchResult is the outcome of one upstream playlist fetch, shared
@@ -185,6 +227,7 @@ func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logge
 		playlistCache:        newSingleflightCache[playlistFetchResult](playlistCacheTTL, playlistGroupKey),
 		epgCache:             newSingleflightCache[epgFetchResult](epgCacheTTL, epgGroupKey),
 		clientBufferDelay:    clientBufferDelay,
+		liveTargets:          newLiveTargetTracker(),
 	}, nil
 }
 
@@ -673,12 +716,24 @@ func writePlaylistResponse(w http.ResponseWriter, result playlistFetchResult, ba
 // refresh. shared reports whether this particular call rode along on another
 // in-flight fetch rather than triggering its own.
 func (s *feedService) servePlaylist(reqCtx context.Context, w http.ResponseWriter, reqHeader http.Header, baseURL string) {
+	result, err := s.getPlaylist(reqCtx, reqHeader)
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+	writePlaylistResponse(w, result, baseURL)
+}
+
+// getPlaylist returns this feed's own top-level playlist, cached-or-fetched
+// the same way servePlaylist always has — pulled out on its own so the admin
+// page's channel listing (see admin.go) can read the very same rewritten
+// playlist a client sees, instead of talking to the upstream a second way.
+func (s *feedService) getPlaylist(reqCtx context.Context, reqHeader http.Header) (playlistFetchResult, error) {
 	logger := loggerFromContext(reqCtx, s.logger)
 
 	if result, ok := s.playlistCache.get(); ok {
 		logger.InfoContext(reqCtx, "playlist fetch", "cached", true)
-		writePlaylistResponse(w, result, baseURL)
-		return
+		return result, nil
 	}
 
 	result, shared, err := s.playlistCache.fetch(func() (playlistFetchResult, error) {
@@ -687,12 +742,11 @@ func (s *feedService) servePlaylist(reqCtx context.Context, w http.ResponseWrite
 	logger.InfoContext(reqCtx, "playlist fetch", "cached", false, "coalesced", shared)
 
 	if err != nil {
-		writeUpstreamError(w, err)
-		return
+		return playlistFetchResult{}, err
 	}
 
 	s.playlistCache.store(result)
-	writePlaylistResponse(w, result, baseURL)
+	return result, nil
 }
 
 // serve fetches target through the repository and writes the appropriate
@@ -750,6 +804,24 @@ func (s *feedService) serveWith(reqCtx context.Context, w http.ResponseWriter, r
 	// live stream worth reconnecting to.
 	isTS := isTSStream(target, contentType, peeked)
 	live := isTS && resp.ContentLength < 0
+
+	// A live relay holds one upstream connection open for the viewer's whole
+	// session, unlike a playlist poll or a single segment fetch — so this is
+	// the one place worth enforcing "only one stream per upstream url": a
+	// second concurrent request for the same channel (another direct viewer,
+	// or a /share link pointing at it) would otherwise open a second upstream
+	// connection for what the provider sees as the same channel. Checked
+	// before any header is written, since the response is a 409 if the target
+	// is already busy.
+	if live {
+		liveKey := target.String()
+		if !s.liveTargets.acquire(liveKey) {
+			logger.WarnContext(reqCtx, "rejecting duplicate live stream request", "target", redact(liveKey))
+			http.Error(w, "channel already being streamed", http.StatusConflict)
+			return
+		}
+		defer s.liveTargets.release(liveKey)
+	}
 
 	if contentType == "" {
 		if isTS {

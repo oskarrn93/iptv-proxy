@@ -188,15 +188,27 @@ func bufferedCopy(w http.ResponseWriter, r io.Reader, lastChunk *[]byte) (int64,
 	}
 }
 
+// randHex returns n random bytes hex-encoded, or an error if the system RNG
+// (crypto/rand) can't be read — the shared primitive behind every unguessable
+// token this package hands out (request ids, share tokens), so they don't
+// each reimplement the same rand.Read+hex.EncodeToString pair.
+func randHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
 // newRequestID returns a short unguessable id for tagging every log line
 // produced while handling one request, so they can be grepped/grouped
 // together (e.g. "request_id=a1b2c3d4e5f6a7b8").
 func newRequestID() string {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return "unknown"
+	id, err := randHex(8)
+	if err != nil {
+		panic("faild to generate request id: " + err.Error())
 	}
-	return hex.EncodeToString(b)
+	return id
 }
 
 type readCloserWrapper struct {

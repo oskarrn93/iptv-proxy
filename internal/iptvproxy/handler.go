@@ -1,14 +1,14 @@
 package iptvproxy
 
 import (
-	"crypto/subtle"
+	"cmp"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,17 +25,12 @@ type Proxy struct {
 	logger         *slog.Logger
 	metricsHandler http.Handler
 	// shares holds every currently-valid temporary share link (see
-	// handleShare/handleCreateShare). Always built, even with AdminToken
-	// unset — handleShare still needs somewhere to look tokens up, and an
-	// empty store just serves 404s.
+	// handleShare/handleCreateShare).
 	shares *shareStore
-	// adminToken guards handleCreateShare; empty means the admin endpoint is
-	// disabled (see Config.AdminToken).
-	adminToken string
 }
 
 func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, error) {
-	p := &Proxy{logger: logger, shares: newShareStore(), adminToken: cfg.AdminToken}
+	p := &Proxy{logger: logger, shares: newShareStore()}
 
 	// Gatherers merges every feed's own registry into one /metrics response
 	// without the feeds sharing a registry outright — each newFeedMetrics
@@ -74,7 +69,14 @@ func (p *Proxy) Mux() *http.ServeMux {
 	mux.HandleFunc("/player_api.php", p.withRequestLogger(p.handleXtreamAPI))
 	mux.HandleFunc("/panel_api.php", p.withRequestLogger(p.handleXtreamAPI))
 	mux.HandleFunc("/share/{token}", p.withRequestLogger(p.handleShare))
+	mux.HandleFunc("/admin", p.withRequestLogger(p.handleAdminPage))
+	mux.HandleFunc("/admin/static/htmx.js", p.withRequestLogger(p.handleAdminHTMX))
+	mux.HandleFunc("/admin/static/json-enc.js", p.withRequestLogger(p.handleAdminJSONEnc))
+	mux.HandleFunc("/admin/feeds", p.withRequestLogger(p.handleAdminFeeds))
+	mux.HandleFunc("/admin/channels", p.withRequestLogger(p.handleAdminChannels))
+	mux.HandleFunc("GET /admin/shares", p.withRequestLogger(p.handleListShares))
 	mux.HandleFunc("POST /admin/shares", p.withRequestLogger(p.handleCreateShare))
+	mux.HandleFunc("DELETE /admin/shares/{token}", p.withRequestLogger(p.handleRevokeShare))
 	mux.HandleFunc("/{prefix}/{username}/{password}/{rest...}", p.withRequestLogger(p.handleStream))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, max-age=0")
@@ -146,6 +148,19 @@ func (p *Proxy) matchFeed(creds Credentials) (matched, candidate *feedService) {
 		}
 	}
 	return nil, candidate
+}
+
+// feedByName finds the configured feed with the given name, for admin
+// endpoints that take a feed name directly rather than deriving it from
+// request credentials (see matchFeed). Same linear-scan rationale applies:
+// once per request, over a handful of feeds.
+func (p *Proxy) feedByName(name string) *feedService {
+	for _, f := range p.feeds {
+		if f.name == name {
+			return f
+		}
+	}
+	return nil
 }
 
 // rejectUnauthorized is the single response to a request whose credentials
@@ -311,41 +326,28 @@ const maxCreateShareBody = 4 << 10
 // createShareRequest is the POST /admin/shares JSON body: which feed to
 // share from, the exact channel link a client already uses against that
 // feed (see parseChannelPath), and how long the resulting share stays valid.
+// ChannelName is purely a display label (the admin page's combobox text for
+// whatever channel_url resolves to) carried through to shareInfo so the
+// active-shares list can show which channel a share is for — it's never used
+// to resolve the target, so an absent or wrong value can't grant more access.
 type createShareRequest struct {
-	Feed       string `json:"feed"`
-	ChannelURL string `json:"channel_url"`
-	TTL        string `json:"ttl"`
-}
-
-// authenticateAdmin reports whether r carries this proxy's configured admin
-// token as a Bearer credential. An unset adminToken always fails closed —
-// see Config.AdminToken.
-func (p *Proxy) authenticateAdmin(r *http.Request) bool {
-	if p.adminToken == "" {
-		return false
-	}
-	bearer, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if !ok {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(bearer), []byte(p.adminToken)) == 1
+	Feed        string `json:"feed"`
+	ChannelURL  string `json:"channel_url"`
+	ChannelName string `json:"channel_name"`
+	TTL         string `json:"ttl"`
 }
 
 // handleCreateShare mints a temporary share for one channel of one feed,
-// given the exact channel URL a client already uses against that feed (the
-// admin token is this endpoint's only auth — see authenticateAdmin — a
-// share itself carries none). It resolves req.ChannelURL back to the real
-// upstream URL through the same feed.streamTarget path a normal /stream
-// request would, so a share can never point anywhere a client couldn't
-// already reach with valid feed credentials.
+// given the exact channel URL a client already uses against that feed (a
+// share itself carries no credentials of its own). Every /admin/* route,
+// this one included, has no auth check of its own — it's reachable only
+// through Traefik's LAN-only router for this path, gated by the tinyauth
+// forward-auth middleware (OIDC login via Pocket ID) — see docker-compose.yml.
+// It resolves req.ChannelURL back to the real upstream URL through the same
+// feed.streamTarget path a normal /stream request would, so a share can never
+// point anywhere a client couldn't already reach with valid feed credentials.
 func (p *Proxy) handleCreateShare(w http.ResponseWriter, r *http.Request) {
 	logger := loggerFromContext(r.Context(), p.logger)
-
-	if !p.authenticateAdmin(r) {
-		logger.WarnContext(r.Context(), "admin auth failed", "remote_addr", r.RemoteAddr, "host", requestHost(r))
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
 
 	var req createShareRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxCreateShareBody)).Decode(&req); err != nil {
@@ -353,13 +355,7 @@ func (p *Proxy) handleCreateShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var feed *feedService
-	for _, f := range p.feeds {
-		if f.name == req.Feed {
-			feed = f
-			break
-		}
-	}
+	feed := p.feedByName(req.Feed)
 	if feed == nil {
 		http.Error(w, "unknown feed", http.StatusNotFound)
 		return
@@ -388,13 +384,34 @@ func (p *Proxy) handleCreateShare(w http.ResponseWriter, r *http.Request) {
 	}
 
 	target := feed.streamTarget(prefix, rest, channelURL.RawQuery)
-	token, expiresAt := p.shares.create(feed, target, classifySessionKind(prefix), ttl)
+	token, expiresAt := p.shares.create(feed, target, classifySessionKind(prefix), ttl, req.ChannelName)
 
 	logger.InfoContext(r.Context(), "share created", "feed", feed.name, "kind", classifySessionKind(prefix), "expires_at", expiresAt)
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"url":        requestBaseURL(r) + "/share/" + token,
-		"expires_at": expiresAt.Format(time.RFC3339),
-	})
+	// An HTML fragment, not JSON: the admin page's #result swaps this
+	// directly in (hx-target="#result" hx-swap="innerHTML" on the form), the
+	// same server-rendered-fragment pattern every other /admin/* route uses.
+	shareURL := requestBaseURL(r) + "/share/" + token
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<p>Share created for <strong>%s</strong>, expires <strong>%s</strong>:</p><p><a href="%s" target="_blank" rel="noopener">%s</a></p>`,
+		html.EscapeString(cmp.Or(req.ChannelName, "this channel")),
+		html.EscapeString(expiresAt.Format("2006-01-02 15:04:05 MST")),
+		html.EscapeString(shareURL),
+		html.EscapeString(shareURL),
+	)
+}
+
+// handleRevokeShare drops one share immediately instead of waiting out its
+// TTL (see shareStore.revoke) — same admin-token auth as handleCreateShare,
+// since revoking is exactly as privileged an action as minting.
+func (p *Proxy) handleRevokeShare(w http.ResponseWriter, r *http.Request) {
+	logger := loggerFromContext(r.Context(), p.logger)
+
+	token := r.PathValue("token")
+	if !p.shares.revoke(token) {
+		http.NotFound(w, r)
+		return
+	}
+	logger.InfoContext(r.Context(), "share revoked")
+	w.WriteHeader(http.StatusNoContent)
 }

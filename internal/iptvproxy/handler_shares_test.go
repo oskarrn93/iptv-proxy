@@ -13,53 +13,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newTestProxyWithAdmin mirrors newTestProxy but also sets an admin token, so
-// /admin/shares tests don't each have to spell out the Config literal.
-func newTestProxyWithAdmin(t *testing.T, upstream, adminToken string) *Proxy {
-	t.Helper()
-	p, err := NewProxy(&Config{
-		ListenAddr: ":0",
-		Feeds:      []FeedConfig{testFeedConfig(upstream)},
-		AdminToken: adminToken,
-	}, testLogger(), true)
-	require.NoError(t, err)
-	return p
-}
-
 func createShareRequestBody(feed, channelURL, ttl string) *strings.Reader {
 	body, _ := json.Marshal(createShareRequest{Feed: feed, ChannelURL: channelURL, TTL: ttl})
 	return strings.NewReader(string(body))
 }
 
-func TestHandleCreateShare_RequiresAdminToken(t *testing.T) {
-	p := newTestProxyWithAdmin(t, "http://upstream.example.com/get.php", "s3cret")
-
-	req := httptest.NewRequest(http.MethodPost, "/admin/shares",
-		createShareRequestBody("test", "http://x/live/alice/secret/1.ts", "1h"))
-	rec := httptest.NewRecorder()
-	p.handleCreateShare(rec, req)
-
-	assert.Equal(t, http.StatusUnauthorized, rec.Code)
-}
-
-func TestHandleCreateShare_DisabledWithoutConfiguredToken(t *testing.T) {
-	p := newTestProxy(t, "http://upstream.example.com/get.php") // no AdminToken set
-
-	req := httptest.NewRequest(http.MethodPost, "/admin/shares",
-		createShareRequestBody("test", "http://x/live/alice/secret/1.ts", "1h"))
-	req.Header.Set("Authorization", "Bearer anything")
-	rec := httptest.NewRecorder()
-	p.handleCreateShare(rec, req)
-
-	assert.Equal(t, http.StatusUnauthorized, rec.Code)
-}
-
 func TestHandleCreateShare_RejectsCredentialsForWrongFeed(t *testing.T) {
-	p := newTestProxyWithAdmin(t, "http://upstream.example.com/get.php", "s3cret")
+	p := newTestProxy(t, "http://upstream.example.com/get.php")
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/shares",
 		createShareRequestBody("test", "http://x/live/mallory/wrong/1.ts", "1h"))
-	req.Header.Set("Authorization", "Bearer s3cret")
 	rec := httptest.NewRecorder()
 	p.handleCreateShare(rec, req)
 
@@ -81,19 +44,21 @@ func TestHandleCreateShare_MintsWorkingShare(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := newTestProxyWithAdmin(t, upstream.URL+"/get.php?username=xtreamuser&password=xtreampass", "s3cret")
+	p := newTestProxy(t, upstream.URL+"/get.php?username=xtreamuser&password=xtreampass")
 
 	createReq := httptest.NewRequest(http.MethodPost, "/admin/shares",
 		createShareRequestBody("test", "http://iptv.example.com/live/alice/secret/segment.ts", "1h"))
-	createReq.Header.Set("Authorization", "Bearer s3cret")
 	createRec := httptest.NewRecorder()
 	p.handleCreateShare(createRec, createReq)
 	require.Equal(t, http.StatusOK, createRec.Code)
 
-	var resp map[string]string
-	require.NoError(t, json.Unmarshal(createRec.Body.Bytes(), &resp))
-	require.Contains(t, resp["url"], "/share/")
-	token := strings.TrimPrefix(resp["url"], "http://example.com/share/")
+	body := createRec.Body.String()
+	const marker = `href="`
+	start := strings.Index(body, marker) + len(marker)
+	require.Greater(t, start, len(marker)-1, "response should contain a share link: %s", body)
+	shareURL := body[start : strings.Index(body[start:], `"`)+start]
+	require.Contains(t, shareURL, "/share/")
+	token := strings.TrimPrefix(shareURL, "http://example.com/share/")
 
 	shareReq := httptest.NewRequest(http.MethodGet, "/share/"+token, nil)
 	shareReq.SetPathValue("token", token)
@@ -124,7 +89,7 @@ func TestHandleShare_RejectsForeignHost(t *testing.T) {
 	feed := p.feeds[0]
 	target, err := url.Parse("http://upstream.example.com/live/x/y/1.ts")
 	require.NoError(t, err)
-	token, _ := p.shares.create(feed, target, sessionKindLive, time.Hour)
+	token, _ := p.shares.create(feed, target, sessionKindLive, time.Hour, "Test Channel")
 
 	req := httptest.NewRequest(http.MethodGet, "/share/"+token+"?u=http://evil.example.com/secret", nil)
 	req.SetPathValue("token", token)
@@ -132,4 +97,85 @@ func TestHandleShare_RejectsForeignHost(t *testing.T) {
 	p.handleShare(rec, req)
 
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestHandleRevokeShare_DropsShareImmediately(t *testing.T) {
+	p := newTestProxy(t, "http://upstream.example.com/get.php")
+	feed := p.feeds[0]
+	target, _ := url.Parse("http://upstream.example.com/live/x/y/1.ts")
+	token, _ := p.shares.create(feed, target, sessionKindLive, time.Hour, "Test Channel")
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/shares/"+token, nil)
+	req.SetPathValue("token", token)
+	rec := httptest.NewRecorder()
+	p.handleRevokeShare(rec, req)
+
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	_, ok := p.shares.lookup(token)
+	assert.False(t, ok, "a revoked share must no longer be servable")
+}
+
+func TestHandleRevokeShare_UnknownToken(t *testing.T) {
+	p := newTestProxy(t, "http://upstream.example.com/get.php")
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/shares/does-not-exist", nil)
+	req.SetPathValue("token", "does-not-exist")
+	rec := httptest.NewRecorder()
+	p.handleRevokeShare(rec, req)
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleListShares_RendersActiveShares(t *testing.T) {
+	p := newTestProxy(t, "http://upstream.example.com/get.php")
+	feed := p.feeds[0]
+	target, _ := url.Parse("http://upstream.example.com/live/x/y/1.ts")
+	token, _ := p.shares.create(feed, target, sessionKindLive, time.Hour, "Test Channel")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/shares", nil)
+	rec := httptest.NewRecorder()
+	p.handleListShares(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), token)
+	assert.Contains(t, rec.Body.String(), "test") // feed name
+}
+
+func TestHandleAdminFeeds_ListsConfiguredFeeds(t *testing.T) {
+	p := newTestProxy(t, "http://upstream.example.com/get.php")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/feeds", nil)
+	rec := httptest.NewRecorder()
+	p.handleAdminFeeds(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `<option value="test">test</option>`)
+}
+
+func TestHandleAdminChannels_ListsChannelsFromRewrittenPlaylist(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = w.Write([]byte("#EXTM3U\n#EXTINF:-1,Channel One\nhttp://upstream.example.com/live/xtreamuser/xtreampass/1.ts\n"))
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream.URL+"/get.php?username=xtreamuser&password=xtreampass")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/channels?feed=test", nil)
+	rec := httptest.NewRecorder()
+	p.handleAdminChannels(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "Channel One")
+	assert.Contains(t, rec.Body.String(), "/live/alice/secret/1.ts")
+}
+
+func TestHandleAdminChannels_UnknownFeed(t *testing.T) {
+	p := newTestProxy(t, "http://upstream.example.com/get.php")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/channels?feed=nope", nil)
+	rec := httptest.NewRecorder()
+	p.handleAdminChannels(rec, req)
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
 }

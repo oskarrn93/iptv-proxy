@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -461,3 +462,94 @@ func TestServePlaylist_RefetchesAfterCacheExpires(t *testing.T) {
 	s.servePlaylist(ctx, w, http.Header{}, "http://proxy.example.com")
 	assert.Equal(t, int64(2), upstreamHits.Load(), "expired cache should trigger a fresh upstream fetch")
 }
+
+func TestLiveTargetTracker_RejectsSecondAcquire(t *testing.T) {
+	tr := newLiveTargetTracker()
+
+	assert.True(t, tr.acquire("http://upstream.example.com/live/x.ts"), "first acquire of an unclaimed target should succeed")
+	assert.False(t, tr.acquire("http://upstream.example.com/live/x.ts"), "second acquire of the same target should be rejected")
+
+	tr.release("http://upstream.example.com/live/x.ts")
+	assert.True(t, tr.acquire("http://upstream.example.com/live/x.ts"), "acquire should succeed again once released")
+}
+
+func TestLiveTargetTracker_DistinctTargetsDontCollide(t *testing.T) {
+	tr := newLiveTargetTracker()
+
+	assert.True(t, tr.acquire("http://upstream.example.com/live/x.ts"))
+	assert.True(t, tr.acquire("http://upstream.example.com/live/y.ts"), "a different target must not be blocked by an unrelated one")
+}
+
+// TestServeWith_RejectsConcurrentLiveStreamToSameTarget is the "one stream
+// per upstream url" guarantee end to end: while a live TS relay for a target
+// is in flight, a second request for the exact same target is rejected with
+// 409 instead of opening a second upstream connection. liveTargetTracker's
+// own release-then-reacquire round trip is covered separately by
+// TestLiveTargetTracker_RejectsSecondAcquire; this test only needs the first
+// relay to still be running when the second request lands.
+func TestServeWith_RejectsConcurrentLiveStreamToSameTarget(t *testing.T) {
+	release := make(chan struct{})
+	// serveWith peeks 512 bytes to sniff the body before deciding it's a live
+	// stream, so the handler has to hand over at least that much up front —
+	// otherwise the peek itself blocks waiting for more bytes that never come,
+	// well before this test's own acquire/reject logic is even reached.
+	filler := bytes.Repeat([]byte{0x47}, 1024)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp2t")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(filler) // no Content-Length -> unbounded body -> "live"
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer func() {
+		close(release)
+		upstream.Close()
+	}()
+
+	s := newTestService(t, upstream.URL+"/get.php")
+	target, err := url.Parse(upstream.URL + "/live/x.ts")
+	require.NoError(t, err)
+
+	firstStarted := make(chan struct{})
+	firstDone := make(chan struct{})
+	firstCtx, firstCancel := context.WithCancel(context.Background())
+	defer firstCancel()
+	go func() {
+		defer close(firstDone)
+		w := newFlushRecorder()
+		go func() {
+			<-w.wroteHeader
+			close(firstStarted)
+		}()
+		s.serve(firstCtx, w, http.Header{}, target, "http://proxy.example.com")
+	}()
+
+	<-firstStarted
+
+	rec := httptest.NewRecorder()
+	s.serve(context.Background(), rec, http.Header{}, target, "http://proxy.example.com")
+	assert.Equal(t, http.StatusConflict, rec.Code, "a second concurrent request for the same live target must be rejected")
+
+	firstCancel()
+	<-firstDone
+}
+
+// flushRecorder wraps httptest.ResponseRecorder with a working Flush that
+// signals wroteHeader once headers are written, so a test can wait for the
+// live relay to actually start before racing a second request against it.
+type flushRecorder struct {
+	*httptest.ResponseRecorder
+	wroteHeader chan struct{}
+	once        sync.Once
+}
+
+func newFlushRecorder() *flushRecorder {
+	return &flushRecorder{ResponseRecorder: httptest.NewRecorder(), wroteHeader: make(chan struct{})}
+}
+
+func (f *flushRecorder) WriteHeader(status int) {
+	f.ResponseRecorder.WriteHeader(status)
+	f.once.Do(func() { close(f.wroteHeader) })
+}
+
+func (f *flushRecorder) Flush() {}

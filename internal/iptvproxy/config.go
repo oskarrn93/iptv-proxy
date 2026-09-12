@@ -28,11 +28,6 @@ type Config struct {
 	// a per-feed one, since it's about the client's playback experience, not
 	// any one upstream's behavior.
 	ClientBuffer ClientBufferConfig `yaml:"client_buffer"`
-	// AdminToken guards POST /admin/shares (see Proxy.handleCreateShare).
-	// Left empty, the admin endpoint is disabled entirely rather than left
-	// reachable with no credential — a temporary-share feature is not worth
-	// standing up an open door for.
-	AdminToken string `yaml:"admin_token"`
 }
 
 // defaultClientBufferDuration is how long a live TS stream is held back from

@@ -32,6 +32,12 @@ go test ./...
 go vet ./...
 ```
 
+`internal/iptvproxy/admin.html`'s feed/channel combobox JS has its own Playwright regression suite (real Chromium, real admin.html, no live server needed — see `internal/iptvproxy/admin_ui_test/README.md`):
+
+```sh
+cd internal/iptvproxy/admin_ui_test && npm ci && npx playwright install chromium && npm test
+```
+
 ## Architecture notes
 
 - `internal/iptvproxy/config.go` — loads and validates `config.yaml` (feeds, per-feed credentials, listen addr).

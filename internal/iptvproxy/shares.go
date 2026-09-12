@@ -1,8 +1,6 @@
 package iptvproxy
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"net/url"
 	"strings"
 	"sync"
@@ -25,6 +23,11 @@ type share struct {
 	// handleShare can bracket activeSessions the same way handleStream does,
 	// without re-deriving it from a token that carries no path prefix itself.
 	kind sessionKind
+	// channelName is the display label the admin page's combobox showed for
+	// this channel at creation time (from the feed's own #EXTINF entry) —
+	// carried through purely so handleListShares can show which channel a
+	// share is for; it plays no role in serving the share.
+	channelName string
 
 	expiresAt time.Time
 }
@@ -57,7 +60,7 @@ func (s *shareStore) reapLocked(now time.Time) {
 
 // create mints a new share for target on feed, valid for ttl (capped at
 // maxShareTTL), and returns its token and absolute expiry.
-func (s *shareStore) create(feed *feedService, target *url.URL, kind sessionKind, ttl time.Duration) (token string, expiresAt time.Time) {
+func (s *shareStore) create(feed *feedService, target *url.URL, kind sessionKind, ttl time.Duration, channelName string) (token string, expiresAt time.Time) {
 	if ttl > maxShareTTL {
 		ttl = maxShareTTL
 	}
@@ -67,7 +70,7 @@ func (s *shareStore) create(feed *feedService, target *url.URL, kind sessionKind
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reapLocked(time.Now())
-	s.shares[token] = share{feed: feed, target: target, kind: kind, expiresAt: expiresAt}
+	s.shares[token] = share{feed: feed, target: target, kind: kind, channelName: channelName, expiresAt: expiresAt}
 	return token, expiresAt
 }
 
@@ -91,19 +94,67 @@ func (s *shareStore) lookup(token string) (sh share, ok bool) {
 	return sh, true
 }
 
+// shareInfo is a share's own state, safe to hand back to the admin page — it
+// carries no upstream credentials, just enough to identify and revoke it.
+type shareInfo struct {
+	Token       string
+	Feed        string
+	ChannelName string
+	Kind        sessionKind
+	ExpiresAt   time.Time
+}
+
+// list returns every currently-valid share, for the admin page's "active
+// shares" view. Order is unspecified — map iteration order — since shares
+// are few enough that the admin page can sort them however it likes.
+func (s *shareStore) list() []shareInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	s.reapLocked(now)
+
+	infos := make([]shareInfo, 0, len(s.shares))
+	for token, sh := range s.shares {
+		infos = append(infos, shareInfo{
+			Token:       token,
+			Feed:        sh.feed.name,
+			ChannelName: sh.channelName,
+			Kind:        sh.kind,
+			ExpiresAt:   sh.expiresAt,
+		})
+	}
+	return infos
+}
+
+// revoke drops token immediately, regardless of its remaining TTL, reporting
+// whether it was actually found. A revoked share's live relay (if any) isn't
+// forcibly disconnected — the viewer's current response keeps streaming to
+// completion — but no new request against the token will be served past this
+// point, and liveTargetTracker's own release (deferred in serveWith) frees
+// the channel for a future stream as soon as that connection ends on its own.
+func (s *shareStore) revoke(token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.shares[token]; !ok {
+		return false
+	}
+	delete(s.shares, token)
+	return true
+}
+
 // randShareToken returns an unguessable token, sized the same way as the
 // standalone stream-proxy's own tokens (stream/main.go) — long enough that
 // guessing one isn't a viable attack against a link that grants access with
 // no further authentication.
 func randShareToken() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	token, err := randHex(16)
+	if err != nil {
 		// crypto/rand failing means the system RNG is broken, not that this
 		// one token can't be generated — panicking here would only be traded
 		// for panicking on the next TLS handshake instead.
 		panic("iptvproxy: crypto/rand unavailable: " + err.Error())
 	}
-	return hex.EncodeToString(b)
+	return token
 }
 
 // shareURIWriter builds the uriWriter a share's own playlist rewrite pass
