@@ -393,9 +393,9 @@ func TestStreamURIPathParts_RoundTrip(t *testing.T) {
 		"/timeshift/alice/secret/60/2024-01-01:00-00/12345.ts",
 		"/live/segment1.ts",
 		"/hlsr/tok3n/alice/secret/451/9/12345.ts",
-		"/stream/alice/secret/12345.ts",         // collides with fallbackStreamPrefix
-		"/alice/secret/12345.ts",                // no type segment, credentials at the start
-		"/stream-no-type/alice/secret/12345.ts", // collides with noTypeStreamPrefix
+		"/stream/alice/secret/12345.ts",     // collides with fallbackStreamPrefix
+		"/alice/secret/12345.ts",            // no type segment, credentials at the start
+		"/bare-creds/alice/secret/12345.ts", // collides with bareCredsStreamPrefix
 		"/",
 		"",
 	}
@@ -415,7 +415,7 @@ func TestClassifySessionKind(t *testing.T) {
 		want   sessionKind
 	}{
 		{"live", sessionKindLive},
-		{noTypeStreamPrefix, sessionKindLive},
+		{bareCredsStreamPrefix, sessionKindLive},
 		{"movie", sessionKindVOD},
 		{"series", sessionKindVOD},
 		{"timeshift", sessionKindOther},

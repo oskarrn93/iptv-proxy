@@ -439,7 +439,7 @@ func (s *feedService) writeStreamURI(out *strings.Builder, resolved *url.URL) {
 // real prefix, so streamURIPath can tell the two forms apart with certainty.
 const fallbackStreamPrefix = "stream"
 
-// noTypeStreamPrefix marks a path shaped like /<username>/<password>/<file...>
+// bareCredsStreamPrefix marks a path shaped like /<username>/<password>/<file...>
 // — credentials right at the start, with no leading type segment (some
 // upstreams omit "live"/"movie"/etc. for live channels). Without a distinct
 // marker for this shape it would fall through to fallbackStreamPrefix, whose
@@ -448,7 +448,7 @@ const fallbackStreamPrefix = "stream"
 // username/password segments would duplicate the ones already inside rest.
 // streamURIPathParts never emits it as a real prefix, so streamURIPath can
 // tell this shape apart from both the standard and fallback ones.
-const noTypeStreamPrefix = "stream-no-type"
+const bareCredsStreamPrefix = "bare-creds"
 
 // streamURIPathParts splits a credential-swapped upstream path — this feed's
 // username/password already standing where the upstream's did — into the
@@ -470,7 +470,7 @@ func streamURIPathParts(path string, creds Credentials) (prefix, rest string) {
 	// SplitN(..., 4) caps the allocation and leaves anything past the 3rd
 	// slash as one unsplit segment, so no strings.Join is needed to rebuild it.
 	segments := strings.SplitN(trimmed, "/", 4)
-	if len(segments) >= 3 && segments[0] != fallbackStreamPrefix && segments[0] != noTypeStreamPrefix &&
+	if len(segments) >= 3 && segments[0] != fallbackStreamPrefix && segments[0] != bareCredsStreamPrefix &&
 		segments[1] == creds.Username && segments[2] == creds.Password {
 		if len(segments) == 4 {
 			rest = segments[3]
@@ -483,7 +483,7 @@ func streamURIPathParts(path string, creds Credentials) (prefix, rest string) {
 		if len(segments3) == 3 {
 			rest = segments3[2]
 		}
-		return noTypeStreamPrefix, rest
+		return bareCredsStreamPrefix, rest
 	}
 
 	return fallbackStreamPrefix, trimmed
@@ -496,13 +496,13 @@ func streamURIPathParts(path string, creds Credentials) (prefix, rest string) {
 var vodStreamPrefixes = map[string]bool{"movie": true, "series": true}
 
 // classifySessionKind reports what kind of /stream request prefix identifies,
-// for the activeSessions gauge. noTypeStreamPrefix and the standard "live"
+// for the activeSessions gauge. bareCredsStreamPrefix and the standard "live"
 // prefix are both live channels; movie/series are VOD; anything else
 // (timeshift, catch-up, or a non-standard upstream shape via
 // fallbackStreamPrefix) is bucketed as "other" rather than guessed at.
 func classifySessionKind(prefix string) sessionKind {
 	switch {
-	case prefix == "live" || prefix == noTypeStreamPrefix:
+	case prefix == "live" || prefix == bareCredsStreamPrefix:
 		return sessionKindLive
 	case vodStreamPrefixes[prefix]:
 		return sessionKindVOD
@@ -518,7 +518,7 @@ func streamURIPath(prefix string, creds Credentials, rest string) string {
 	switch prefix {
 	case fallbackStreamPrefix:
 		return "/" + rest
-	case noTypeStreamPrefix:
+	case bareCredsStreamPrefix:
 		return "/" + creds.Username + "/" + creds.Password + "/" + rest
 	default:
 		return "/" + prefix + "/" + creds.Username + "/" + creds.Password + "/" + rest
