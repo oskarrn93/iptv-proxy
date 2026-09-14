@@ -28,6 +28,14 @@ type Config struct {
 	// a per-feed one, since it's about the client's playback experience, not
 	// any one upstream's behavior.
 	ClientBuffer ClientBufferConfig `yaml:"client_buffer"`
+	// TrustedProxies lists the reverse proxies (e.g. Traefik's network) whose
+	// X-Forwarded-* headers are believed. Requests from anywhere else have
+	// those headers stripped. Empty trusts no one.
+	TrustedProxies []string `yaml:"trusted_proxies" validate:"dive,cidr"`
+	// AdminAllowedCIDRs lists the original client addresses allowed to reach
+	// /admin/*, which additionally must arrive via a trusted proxy. Empty
+	// disables the admin UI entirely.
+	AdminAllowedCIDRs []string `yaml:"admin_allowed_cidrs" validate:"dive,cidr"`
 }
 
 // defaultClientBufferDuration is how long a live TS stream is held back from
@@ -154,6 +162,8 @@ func describeFieldError(fe validator.FieldError) string {
 		return fmt.Sprintf("%s is required", fe.Field())
 	case "http_url":
 		return fmt.Sprintf("%s must be an absolute http:// or https:// URL", fe.Field())
+	case "cidr":
+		return fmt.Sprintf("%s entries must be CIDR ranges like 192.168.1.0/24 (got %q)", fe.Field(), fe.Value())
 	case "min":
 		// The only "min" rule is feeds having at least one entry.
 		return "config has no feeds defined"

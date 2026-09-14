@@ -1,6 +1,11 @@
 package iptvproxy
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
 	"net/url"
 	"strings"
 	"sync"
@@ -28,8 +33,62 @@ type share struct {
 	// carried through purely so handleListShares can show which channel a
 	// share is for; it plays no role in serving the share.
 	channelName string
+	// refs seals and opens the nested-URI refs this share's rewritten
+	// playlists carry (see shareURIWriter/openRef). The key is per share and
+	// never leaves the process, so a ref is opaque to the viewer, can't be
+	// forged, and is useless against any other share.
+	refs cipher.AEAD
 
 	expiresAt time.Time
+}
+
+// errBadShareRef covers every way a ref can fail to open — malformed,
+// truncated, tampered with, or sealed by another share — without saying which.
+var errBadShareRef = errors.New("invalid share ref")
+
+// sealRef encrypts an upstream URL into a URL-safe ref.
+func (sh share) sealRef(u *url.URL) string {
+	nonce := make([]byte, sh.refs.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		panic("iptvproxy: crypto/rand unavailable: " + err.Error())
+	}
+	sealed := sh.refs.Seal(nonce, nonce, []byte(u.String()), nil)
+	return base64.RawURLEncoding.EncodeToString(sealed)
+}
+
+// openRef reverses sealRef.
+func (sh share) openRef(ref string) (*url.URL, error) {
+	sealed, err := base64.RawURLEncoding.DecodeString(ref)
+	if err != nil || len(sealed) < sh.refs.NonceSize() {
+		return nil, errBadShareRef
+	}
+	nonce, ciphertext := sealed[:sh.refs.NonceSize()], sealed[sh.refs.NonceSize():]
+	plain, err := sh.refs.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, errBadShareRef
+	}
+	u, err := url.Parse(string(plain))
+	if err != nil || !u.IsAbs() {
+		return nil, errBadShareRef
+	}
+	return u, nil
+}
+
+// newShareAEAD returns AES-256-GCM under a fresh random key.
+func newShareAEAD() cipher.AEAD {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		panic("iptvproxy: crypto/rand unavailable: " + err.Error())
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic("iptvproxy: aes.NewCipher: " + err.Error())
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		panic("iptvproxy: cipher.NewGCM: " + err.Error())
+	}
+	return aead
 }
 
 // shareStore holds every currently-valid share in memory, keyed by its
@@ -70,7 +129,7 @@ func (s *shareStore) create(feed *feedService, target *url.URL, kind sessionKind
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reapLocked(time.Now())
-	s.shares[token] = share{feed: feed, target: target, kind: kind, channelName: channelName, expiresAt: expiresAt}
+	s.shares[token] = share{feed: feed, target: target, kind: kind, channelName: channelName, refs: newShareAEAD(), expiresAt: expiresAt}
 	return token, expiresAt
 }
 
@@ -142,8 +201,7 @@ func (s *shareStore) revoke(token string) bool {
 	return true
 }
 
-// randShareToken returns an unguessable token, sized the same way as the
-// standalone stream-proxy's own tokens (stream/main.go) — long enough that
+// randShareToken returns an unguessable 128-bit token — long enough that
 // guessing one isn't a viable attack against a link that grants access with
 // no further authentication.
 func randShareToken() string {
@@ -159,18 +217,19 @@ func randShareToken() string {
 
 // shareURIWriter builds the uriWriter a share's own playlist rewrite pass
 // uses in place of writeStreamURI: every nested segment/sub-playlist/key URI
-// becomes a /share/<token>?u=<resolved> link instead of an Xtream-shaped
+// becomes a /share/<token>?ref=<sealed> link instead of an Xtream-shaped
 // /stream one, since a share has no feed credentials of its own to write
-// into the link. handleShare constrains an incoming u to the same upstream
-// host the share was created against (see streamTarget's identical
-// reasoning) before ever fetching it.
-func shareURIWriter(token string) uriWriter {
+// into the link. The resolved upstream URL is sealed rather than written
+// out, because for Xtream upstreams it embeds the real upstream username and
+// password in its path — a plain URL here would hand those to anyone holding
+// the share link, for longer than the share lives.
+func shareURIWriter(token string, sh share) uriWriter {
 	return func(out *strings.Builder, resolved *url.URL) {
 		out.WriteString(baseURLPlaceholder)
 		out.WriteString("/share/")
 		out.WriteString(token)
-		out.WriteString("?u=")
-		out.WriteString(url.QueryEscape(resolved.String()))
+		out.WriteString("?ref=")
+		out.WriteString(sh.sealRef(resolved))
 	}
 }
 

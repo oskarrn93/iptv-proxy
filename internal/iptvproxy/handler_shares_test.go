@@ -81,22 +81,107 @@ func TestHandleShare_UnknownOrExpiredToken(t *testing.T) {
 }
 
 // TestHandleShare_RejectsForeignHost checks the same SSRF-closing property
-// handleStream already has (see TestHandleStream_CannotReachAnotherHost): a
-// share's own "u" query param can only ever point back at the upstream host
-// the share was created against, never an arbitrary one.
+// handleStream already has (see TestHandleStream_CannotReachAnotherHost): even
+// a correctly sealed ref can only ever point back at the upstream host the
+// share was created against, never an arbitrary one.
 func TestHandleShare_RejectsForeignHost(t *testing.T) {
 	p := newTestProxy(t, "http://upstream.example.com/get.php")
 	feed := p.feeds[0]
 	target, err := url.Parse("http://upstream.example.com/live/x/y/1.ts")
 	require.NoError(t, err)
 	token, _ := p.shares.create(feed, target, sessionKindLive, time.Hour, "Test Channel")
+	sh, ok := p.shares.lookup(token)
+	require.True(t, ok)
+	evil, _ := url.Parse("http://evil.example.com/secret")
 
-	req := httptest.NewRequest(http.MethodGet, "/share/"+token+"?u=http://evil.example.com/secret", nil)
+	req := httptest.NewRequest(http.MethodGet, "/share/"+token+"?ref="+sh.sealRef(evil), nil)
 	req.SetPathValue("token", token)
 	rec := httptest.NewRecorder()
 	p.handleShare(rec, req)
 
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestHandleShare_RejectsForgedOrForeignRef: a viewer can't write their own
+// ref, and a ref sealed for one share doesn't open against another.
+func TestHandleShare_RejectsForgedOrForeignRef(t *testing.T) {
+	p := newTestProxy(t, "http://upstream.example.com/get.php")
+	feed := p.feeds[0]
+	target, _ := url.Parse("http://upstream.example.com/live/x/y/1.ts")
+	tokenA, _ := p.shares.create(feed, target, sessionKindLive, time.Hour, "A")
+	tokenB, _ := p.shares.create(feed, target, sessionKindLive, time.Hour, "B")
+	shB, _ := p.shares.lookup(tokenB)
+	other, _ := url.Parse("http://upstream.example.com/live/x/y/2.ts")
+
+	for name, ref := range map[string]string{
+		"plain url":         url.QueryEscape(other.String()),
+		"garbage":           "AAAA",
+		"other share's ref": shB.sealRef(other),
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/share/"+tokenA+"?ref="+ref, nil)
+			req.SetPathValue("token", tokenA)
+			rec := httptest.NewRecorder()
+			p.handleShare(rec, req)
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+		})
+	}
+}
+
+// TestHandleShare_PlaylistDoesNotLeakUpstream is the regression test for share
+// playlists once carrying each nested upstream URL — real Xtream username and
+// password in its path — in plain text. Following a rewritten ref must still
+// reach the right upstream path.
+func TestHandleShare_PlaylistDoesNotLeakUpstream(t *testing.T) {
+	var segmentHits int
+	var upstreamHost string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/live/xtreamuser/xtreampass/1.m3u8":
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n720p.m3u8\n#EXTINF:4,\nseg1.ts\n"))
+		case "/live/xtreamuser/xtreampass/seg1.ts":
+			segmentHits++
+			w.Header().Set("Content-Type", "video/mp2t")
+			_, _ = w.Write([]byte{0x47, 0x00})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+	upstreamHost = strings.TrimPrefix(upstream.URL, "http://")
+
+	p := newTestProxy(t, upstream.URL+"/get.php?username=xtreamuser&password=xtreampass")
+	target, _ := url.Parse(upstream.URL + "/live/xtreamuser/xtreampass/1.m3u8")
+	token, _ := p.shares.create(p.feeds[0], target, sessionKindLive, time.Hour, "x")
+
+	req := httptest.NewRequest(http.MethodGet, "/share/"+token, nil)
+	req.SetPathValue("token", token)
+	rec := httptest.NewRecorder()
+	p.handleShare(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	body := rec.Body.String()
+	for _, secret := range []string{"xtreamuser", "xtreampass", upstreamHost, url.QueryEscape(upstreamHost)} {
+		assert.NotContains(t, body, secret)
+	}
+
+	var segLink string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.Contains(line, "/share/") && !strings.HasPrefix(line, "#") {
+			segLink = line // last URI line is seg1.ts
+		}
+	}
+	require.NotEmpty(t, segLink)
+	segURL, err := url.Parse(segLink)
+	require.NoError(t, err)
+
+	segReq := httptest.NewRequest(http.MethodGet, segURL.RequestURI(), nil)
+	segReq.SetPathValue("token", token)
+	segRec := httptest.NewRecorder()
+	p.handleShare(segRec, segReq)
+	assert.Equal(t, http.StatusOK, segRec.Code)
+	assert.Equal(t, 1, segmentHits)
 }
 
 func TestHandleRevokeShare_DropsShareImmediately(t *testing.T) {

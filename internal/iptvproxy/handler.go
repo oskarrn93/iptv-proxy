@@ -27,10 +27,20 @@ type Proxy struct {
 	// shares holds every currently-valid temporary share link (see
 	// handleShare/handleCreateShare).
 	shares *shareStore
+	// trust decides whose X-Forwarded-* headers count and who may reach
+	// /admin/* (see trust.go).
+	trust trustPolicy
 }
 
 func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, error) {
-	p := &Proxy{logger: logger, shares: newShareStore()}
+	trust, err := newTrustPolicy(cfg.TrustedProxies, cfg.AdminAllowedCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("trust config: %w", err)
+	}
+	p := &Proxy{logger: logger, shares: newShareStore(), trust: trust}
+	if len(cfg.AdminAllowedCIDRs) == 0 || len(cfg.TrustedProxies) == 0 {
+		logger.Warn("admin UI disabled: set trusted_proxies and admin_allowed_cidrs in config.yaml to enable it")
+	}
 
 	// Gatherers merges every feed's own registry into one /metrics response
 	// without the feeds sharing a registry outright — each newFeedMetrics
@@ -69,14 +79,14 @@ func (p *Proxy) Mux() *http.ServeMux {
 	mux.HandleFunc("/player_api.php", p.withRequestLogger(p.handleXtreamAPI))
 	mux.HandleFunc("/panel_api.php", p.withRequestLogger(p.handleXtreamAPI))
 	mux.HandleFunc("/share/{token}", p.withRequestLogger(p.handleShare))
-	mux.HandleFunc("/admin", p.withRequestLogger(p.handleAdminPage))
-	mux.HandleFunc("/admin/static/htmx.js", p.withRequestLogger(p.handleAdminHTMX))
-	mux.HandleFunc("/admin/static/json-enc.js", p.withRequestLogger(p.handleAdminJSONEnc))
-	mux.HandleFunc("/admin/feeds", p.withRequestLogger(p.handleAdminFeeds))
-	mux.HandleFunc("/admin/channels", p.withRequestLogger(p.handleAdminChannels))
-	mux.HandleFunc("GET /admin/shares", p.withRequestLogger(p.handleListShares))
-	mux.HandleFunc("POST /admin/shares", p.withRequestLogger(p.handleCreateShare))
-	mux.HandleFunc("DELETE /admin/shares/{token}", p.withRequestLogger(p.handleRevokeShare))
+	mux.HandleFunc("/admin", p.withRequestLogger(p.adminOnly(p.handleAdminPage)))
+	mux.HandleFunc("/admin/static/htmx.js", p.withRequestLogger(p.adminOnly(p.handleAdminHTMX)))
+	mux.HandleFunc("/admin/static/json-enc.js", p.withRequestLogger(p.adminOnly(p.handleAdminJSONEnc)))
+	mux.HandleFunc("/admin/feeds", p.withRequestLogger(p.adminOnly(p.handleAdminFeeds)))
+	mux.HandleFunc("/admin/channels", p.withRequestLogger(p.adminOnly(p.handleAdminChannels)))
+	mux.HandleFunc("GET /admin/shares", p.withRequestLogger(p.adminOnly(p.handleListShares)))
+	mux.HandleFunc("POST /admin/shares", p.withRequestLogger(p.adminOnly(p.handleCreateShare)))
+	mux.HandleFunc("DELETE /admin/shares/{token}", p.withRequestLogger(p.adminOnly(p.handleRevokeShare)))
 	mux.HandleFunc("/{prefix}/{username}/{password}/{rest...}", p.withRequestLogger(p.handleStream))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, max-age=0")
@@ -124,9 +134,12 @@ func (s *feedService) instrument(r route, host string, w http.ResponseWriter, ne
 // withRequestLogger stamps every request with its own request_id and attaches
 // a logger carrying it to the request context, so every log line produced
 // while handling this request — in this handler, the service, and the
-// repository — can be grouped together by grepping on request_id.
+// repository — can be grouped together by grepping on request_id. It's also
+// the one wrapper every app route shares, so it drops X-Forwarded-* headers
+// from untrusted peers before any handler can read them.
 func (p *Proxy) withRequestLogger(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		p.trust.stripUntrustedForwarded(r)
 		reqLogger := p.logger.With("request_id", newRequestID())
 		next(w, r.WithContext(withLogger(r.Context(), reqLogger)))
 	}
@@ -286,10 +299,11 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request) {
 // handleShare serves a temporary, token-scoped share created by
 // handleCreateShare. A share carries no feed credentials of its own — token
 // possession plus not-yet-expired is the whole auth check — so an expired or
-// unknown token gets the same 404 as one that never existed, and a nested
-// playlist URI (see shareURIWriter) is only ever followed back onto the same
-// upstream host the share was created against, never an arbitrary one a
-// client supplies.
+// unknown token gets the same 404 as one that never existed. A nested
+// playlist URI arrives as an encrypted ref (see shareURIWriter) that only
+// this share's key opens, so a viewer can neither read the upstream URL (and
+// the credentials in it) nor forge a ref to some other path; the decrypted
+// URL is still held to the share's own upstream scheme and host.
 func (p *Proxy) handleShare(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
 	sh, ok := p.shares.lookup(token)
@@ -299,10 +313,10 @@ func (p *Proxy) handleShare(w http.ResponseWriter, r *http.Request) {
 	}
 
 	target := sh.target
-	if raw := r.URL.Query().Get("u"); raw != "" {
-		u, err := url.Parse(raw)
-		if err != nil || !u.IsAbs() || u.Host != sh.target.Host {
-			http.Error(w, "bad u param", http.StatusBadRequest)
+	if ref := r.URL.Query().Get("ref"); ref != "" {
+		u, err := sh.openRef(ref)
+		if err != nil || u.Scheme != sh.target.Scheme || u.Host != sh.target.Host {
+			http.Error(w, "bad ref param", http.StatusBadRequest)
 			return
 		}
 		target = u
@@ -314,7 +328,7 @@ func (p *Proxy) handleShare(w http.ResponseWriter, r *http.Request) {
 	sh.feed.instrument(routeShare, requestHost(r), w, func(w http.ResponseWriter) {
 		loggerFromContext(r.Context(), sh.feed.logger).InfoContext(r.Context(), "share request",
 			"feed", sh.feed.name, "method", r.Method, "remote_addr", r.RemoteAddr, "host", requestHost(r))
-		sh.feed.serveWith(r.Context(), w, r.Header, target, requestBaseURL(r), shareURIWriter(token))
+		sh.feed.serveWith(r.Context(), w, r.Header, target, requestBaseURL(r), shareURIWriter(token, sh))
 	})
 }
 
@@ -340,9 +354,10 @@ type createShareRequest struct {
 // handleCreateShare mints a temporary share for one channel of one feed,
 // given the exact channel URL a client already uses against that feed (a
 // share itself carries no credentials of its own). Every /admin/* route,
-// this one included, has no auth check of its own — it's reachable only
-// through Traefik's LAN-only router for this path, gated by the tinyauth
-// forward-auth middleware (OIDC login via Pocket ID) — see docker-compose.yml.
+// this one included, is wrapped in adminOnly (trusted proxy + allowed client
+// CIDR) and relies on Traefik's admin router for login — LAN-only, gated by
+// the tinyauth forward-auth middleware (OIDC login via Pocket ID) — see
+// docker-compose.yml.
 // It resolves req.ChannelURL back to the real upstream URL through the same
 // feed.streamTarget path a normal /stream request would, so a share can never
 // point anywhere a client couldn't already reach with valid feed credentials.
@@ -402,7 +417,7 @@ func (p *Proxy) handleCreateShare(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleRevokeShare drops one share immediately instead of waiting out its
-// TTL (see shareStore.revoke) — same admin-token auth as handleCreateShare,
+// TTL (see shareStore.revoke) — same adminOnly gating as handleCreateShare,
 // since revoking is exactly as privileged an action as minting.
 func (p *Proxy) handleRevokeShare(w http.ResponseWriter, r *http.Request) {
 	logger := loggerFromContext(r.Context(), p.logger)
