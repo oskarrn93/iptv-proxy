@@ -21,6 +21,21 @@ jobs:
   actionlint:
     uses: oskarrn93/github-actions/.github/workflows/actionlint.yml@da698a589fd694fa38175bc7af7404b4a509faab # v1
 
+  admin-ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: internal/iptvproxy/admin_ui_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      # Screenshot baselines are rendered on macOS and fonts differ on Linux.
+      - run: npx playwright test --grep-invert @visual
+
   docker:
     runs-on: ubuntu-latest
     steps:

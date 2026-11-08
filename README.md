@@ -63,6 +63,8 @@ HTTP Basic Auth also works in place of the query parameters.
 
 ## Admin page
 
+![Admin page with a new share link and the active shares table](docs/screenshots/admin.png)
+
 `/admin` creates and revokes share links. The app has no login of its own, so put it behind an authenticating reverse proxy.
 
 As a backstop, `/admin/*` only answers requests that arrive through a `trusted_proxies` peer from a client inside `admin_allowed_cidrs`. If either list is empty, the admin page is disabled.
