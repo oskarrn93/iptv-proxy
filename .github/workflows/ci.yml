@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: oskarrn93/github-actions/.github/workflows/go-test.yml@da698a589fd694fa38175bc7af7404b4a509faab # v1
+    with:
+      race: true
+
+  govulncheck:
+    uses: oskarrn93/github-actions/.github/workflows/govulncheck.yml@da698a589fd694fa38175bc7af7404b4a509faab # v1
+
+  actionlint:
+    uses: oskarrn93/github-actions/.github/workflows/actionlint.yml@da698a589fd694fa38175bc7af7404b4a509faab # v1
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: docker build .
