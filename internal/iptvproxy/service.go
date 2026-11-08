@@ -337,8 +337,8 @@ func (s *feedService) rewritePlaylist(r io.Reader, srcURL *url.URL, sizeHint int
 			}
 			skipURI = false
 			out.WriteString(line)
-		case strings.HasPrefix(trimmed, "#EXT-X-KEY") || strings.HasPrefix(trimmed, "#EXT-X-MAP"):
-			out.WriteString(rewriteAttrURI(trimmed, srcURL, writeURI))
+		case strings.HasPrefix(trimmed, "#EXT-X-"):
+			out.WriteString(rewriteAttrURI(line, srcURL, writeURI))
 		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
 			out.WriteString(line)
 		default:
@@ -505,13 +505,13 @@ func streamURIPath(prefix string, creds Credentials, rest string) string {
 	}
 }
 
-// attrURIPattern matches one quoted URI= attribute on an #EXT-X-KEY /
-// #EXT-X-MAP line. Written as an alternation over the two quote styles rather
-// than with a backreference, which Go's RE2 engine does not support.
+// attrURIPattern matches one quoted URI= attribute on an #EXT-X- tag.
+// Written as an alternation over the two quote styles rather than with a
+// backreference, which Go's RE2 engine does not support.
 var attrURIPattern = regexp.MustCompile(`(?i)URI=(?:"[^"]*"|'[^']*')`)
 
-// rewriteAttrURI rewrites every quoted URI= attribute on an #EXT-X-KEY /
-// #EXT-X-MAP line. ReplaceAllStringFunc scans the original line left to right
+// rewriteAttrURI rewrites every quoted URI= attribute on an #EXT-X- tag.
+// ReplaceAllStringFunc scans the original line left to right
 // and never re-examines what it substitutes in, so a replacement that itself
 // begins with `URI=` cannot be re-wrapped.
 func rewriteAttrURI(line string, base *url.URL, writeURI uriWriter) string {
