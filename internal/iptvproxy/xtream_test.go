@@ -1,6 +1,7 @@
 package iptvproxy
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -143,4 +144,39 @@ func TestMux_XtreamAPIRoutesRegistered(t *testing.T) {
 		require.Equal(t, http.StatusOK, rec.Code, "path %s", path)
 		assert.JSONEq(t, `{"ok":true}`, rec.Body.String())
 	}
+}
+
+func TestHandleXtreamAPI_BasicAuthStillSendsUpstreamCredentials(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "xtreamuser", r.URL.Query().Get("username"))
+		assert.Equal(t, "xtreampass", r.URL.Query().Get("password"))
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream.URL+"/get.php?username=xtreamuser&password=xtreampass")
+
+	req := httptest.NewRequest(http.MethodGet, "/player_api.php?action=get_live_categories", nil)
+	req.SetBasicAuth("alice", "secret")
+	rec := httptest.NewRecorder()
+	p.handleXtreamAPI(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestHandleXtreamAPI_OversizedBodyIsNotPassedThrough(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"direct_source":"http://upstream/live/xtreamuser/xtreampass/1.ts","pad":"`))
+		_, _ = w.Write(bytes.Repeat([]byte("a"), maxXtreamAPIBody))
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream.URL+"/get.php?username=xtreamuser&password=xtreampass")
+
+	req := httptest.NewRequest(http.MethodGet, "/player_api.php?username=alice&password=secret", nil)
+	rec := httptest.NewRecorder()
+	p.handleXtreamAPI(rec, req)
+
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
+	assert.NotContains(t, rec.Body.String(), "xtreampass")
 }
