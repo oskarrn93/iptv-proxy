@@ -1,7 +1,8 @@
 # static
 
-Vendored JS for `../admin.html`, go:embedded by `../admin.go`
-(`adminHTMXJS`/`adminJSONEncJS`) and served at `/admin/static/htmx.js` /
+`admin.css` and `admin.js` are the admin page's own code. The rest is vendored
+JS for `../admin.html`, go:embedded by `../admin.go`
+(`adminStatic`) and served at `/admin/static/htmx.js` /
 `/admin/static/json-enc.js` — kept local rather than fetched from a CDN so
 the admin page needs no outbound internet access, like every other route in
 this LAN-only proxy.

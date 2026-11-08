@@ -2,10 +2,11 @@ package iptvproxy
 
 import (
 	"cmp"
-	_ "embed"
-	"fmt"
-	"html"
+	"embed"
+	"html/template"
+	"mime"
 	"net/http"
+	"path"
 	"strings"
 )
 
@@ -18,21 +19,34 @@ import (
 //go:embed admin.html
 var adminPageHTML []byte
 
-// adminHTMXJS and adminJSONEncJS are vendored copies of htmx and its
-// json-enc extension (pinned version — see static/README.md), served
-// locally rather than fetched from a CDN so the admin page works with no
-// outbound internet access, matching every other route in this LAN-only
-// proxy. admin.html's <script src> tags must point at whatever path these
-// are registered under (see handler.go) — keep both in sync when bumping
-// the vendored version. admin_ui_test's Playwright suite serves these same
-// files (via server.js), not a separate copy, so there's nothing else to
-// keep in sync for tests.
+// adminStatic holds the admin page's own CSS/JS and the vendored htmx files
+// (pinned version — see static/README.md), served locally rather than fetched
+// from a CDN so the page works with no outbound internet access, matching
+// every other route in this LAN-only proxy.
 //
-//go:embed static/htmx.js
-var adminHTMXJS []byte
+//go:embed static/*.js static/*.css
+var adminStatic embed.FS
 
-//go:embed static/json-enc.js
-var adminJSONEncJS []byte
+// adminFragmentsHTML holds the markup the admin API returns for htmx to swap.
+//
+//go:embed admin_fragments.html
+var adminFragmentsHTML string
+
+var adminFragments = template.Must(template.New("").Parse(adminFragmentsHTML))
+
+// renderAdminFragment writes one template from admin_fragments.html. Headers
+// are already sent by the time execution can fail, so there is no status left
+// to report an error with.
+func renderAdminFragment(w http.ResponseWriter, name string, data any) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = adminFragments.ExecuteTemplate(w, name, data)
+}
+
+// adminOption is one <option> in an admin page feed or channel list.
+type adminOption struct {
+	Value string
+	Label string
+}
 
 // handleAdminPage serves the static admin page. No-store since this page's
 // JS has already shipped fixes for bugs that only reproduced from a stale
@@ -45,19 +59,18 @@ func (p *Proxy) handleAdminPage(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write(adminPageHTML)
 }
 
-// handleAdminHTMX and handleAdminJSONEnc serve the vendored JS backing
-// admin.html's <script src> tags — see adminHTMXJS/adminJSONEncJS. Also
-// no-store, for the same reason as handleAdminPage.
-func (p *Proxy) handleAdminHTMX(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+// handleAdminStatic serves the files in adminStatic. No-store for the same
+// reason as handleAdminPage.
+func (p *Proxy) handleAdminStatic(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("file")
+	body, err := adminStatic.ReadFile("static/" + name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", mime.TypeByExtension(path.Ext(name)))
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(adminHTMXJS)
-}
-
-func (p *Proxy) handleAdminJSONEnc(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(adminJSONEncJS)
+	_, _ = w.Write(body)
 }
 
 // handleAdminFeeds lists configured feed names as <option> elements for the
@@ -65,10 +78,11 @@ func (p *Proxy) handleAdminJSONEnc(w http.ResponseWriter, _ *http.Request) {
 // htmx page that swaps markup fragments directly rather than parsing JSON
 // itself.
 func (p *Proxy) handleAdminFeeds(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	options := make([]adminOption, 0, len(p.feeds))
 	for _, f := range p.feeds {
-		fmt.Fprintf(w, "<option value=\"%s\">%s</option>", html.EscapeString(f.name), html.EscapeString(f.name))
+		options = append(options, adminOption{Value: f.name, Label: f.name})
 	}
+	renderAdminFragment(w, "options", options)
 }
 
 // handleAdminChannels lists the requested feed's channels as <option>
@@ -89,11 +103,13 @@ func (p *Proxy) handleAdminChannels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	baseURL := requestBaseURL(r)
-	for _, ch := range parseChannelEntries(result.body) {
-		fmt.Fprintf(w, "<option value=\"%s\">%s</option>", html.EscapeString(applyBaseURL(ch.URL, baseURL)), html.EscapeString(ch.Name))
+	entries := parseChannelEntries(result.body)
+	options := make([]adminOption, 0, len(entries))
+	for _, ch := range entries {
+		options = append(options, adminOption{Value: applyBaseURL(ch.URL, baseURL), Label: ch.Name})
 	}
+	renderAdminFragment(w, "options", options)
 }
 
 // handleListShares renders every currently-active share as an HTML table row
@@ -101,30 +117,30 @@ func (p *Proxy) handleAdminChannels(w http.ResponseWriter, r *http.Request) {
 // this after creating a share and after revoking one, rather than tracking
 // share state of its own in JS.
 func (p *Proxy) handleListShares(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	shares := p.shares.list()
-	if len(shares) == 0 {
-		fmt.Fprint(w, "<tr><td colspan=\"6\"><em>no active shares</em></td></tr>")
-		return
-	}
 	baseURL := requestBaseURL(r)
+	shares := p.shares.list()
+	rows := make([]adminShareRow, 0, len(shares))
 	for _, sh := range shares {
-		token := html.EscapeString(sh.Token)
-		shareURL := baseURL + "/share/" + sh.Token
-		fmt.Fprintf(w, "<tr id=\"share-%s\">"+
-			"<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td><a href=\"%s\" target=\"_blank\" rel=\"noopener\">watch</a></td>"+
-			"<td><button class=\"small\" hx-delete=\"/admin/shares/%s\" hx-target=\"#share-%s\" hx-swap=\"outerHTML\">revoke</button></td>"+
-			"</tr>",
-			token,
-			html.EscapeString(cmp.Or(sh.ChannelName, "(unnamed channel)")),
-			html.EscapeString(sh.Feed),
-			html.EscapeString(string(sh.Kind)),
-			html.EscapeString(sh.ExpiresAt.Format("15:04:05 MST")),
-			html.EscapeString(shareURL),
-			token,
-			token,
-		)
+		rows = append(rows, adminShareRow{
+			Token:   sh.Token,
+			Channel: cmp.Or(sh.ChannelName, "(unnamed channel)"),
+			Feed:    sh.Feed,
+			Kind:    string(sh.Kind),
+			Expires: sh.ExpiresAt.Format("15:04:05 MST"),
+			URL:     baseURL + "/share/" + sh.Token,
+		})
 	}
+	renderAdminFragment(w, "shares", rows)
+}
+
+// adminShareRow is one row of the admin page's active shares table.
+type adminShareRow struct {
+	Token   string
+	Channel string
+	Feed    string
+	Kind    string
+	Expires string
+	URL     string
 }
 
 // channelEntry is one parsed #EXTINF/URI pair from a feed's own rewritten

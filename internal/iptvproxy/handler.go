@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
-	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -83,8 +82,7 @@ func (p *Proxy) Mux() *http.ServeMux {
 	mux.HandleFunc("/panel_api.php", p.withRequestLogger(p.handleXtreamAPI))
 	mux.HandleFunc("/share/{token}", p.withRequestLogger(p.handleShare))
 	admin("/admin", p.handleAdminPage)
-	admin("/admin/static/htmx.js", p.handleAdminHTMX)
-	admin("/admin/static/json-enc.js", p.handleAdminJSONEnc)
+	admin("/admin/static/{file}", p.handleAdminStatic)
 	admin("/admin/feeds", p.handleAdminFeeds)
 	admin("/admin/channels", p.handleAdminChannels)
 	admin("GET /admin/shares", p.handleListShares)
@@ -415,13 +413,11 @@ func (p *Proxy) handleCreateShare(w http.ResponseWriter, r *http.Request) {
 	// directly in (hx-target="#result" hx-swap="innerHTML" on the form), the
 	// same server-rendered-fragment pattern every other /admin/* route uses.
 	shareURL := requestBaseURL(r) + "/share/" + token
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<p>Share created for <strong>%s</strong>, expires <strong>%s</strong>:</p><p><a href="%s" target="_blank" rel="noopener">%s</a></p>`,
-		html.EscapeString(cmp.Or(req.ChannelName, "this channel")),
-		html.EscapeString(expiresAt.Format("2006-01-02 15:04:05 MST")),
-		html.EscapeString(shareURL),
-		html.EscapeString(shareURL),
-	)
+	renderAdminFragment(w, "share-created", struct{ Channel, Expires, URL string }{
+		Channel: cmp.Or(req.ChannelName, "this channel"),
+		Expires: expiresAt.Format("2006-01-02 15:04:05 MST"),
+		URL:     shareURL,
+	})
 }
 
 // handleRevokeShare drops one share immediately instead of waiting out its
