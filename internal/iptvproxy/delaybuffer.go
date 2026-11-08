@@ -1,6 +1,7 @@
 package iptvproxy
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"math"
@@ -86,8 +87,7 @@ func (dr *delayedReader) pump(src io.Reader) {
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
+			chunk := bytes.Clone(buf[:n])
 			select {
 			case dr.chunks <- delayChunk{data: chunk, at: time.Now()}:
 			case <-dr.ctx.Done():
@@ -125,10 +125,7 @@ func (dr *delayedReader) Read(p []byte) (int, error) {
 		// dr.delay of wall-clock time since streaming started, rather than
 		// applying the full delay from the very first chunk — see the
 		// delayedReader doc comment.
-		effectiveDelay := dr.delay
-		if elapsed := chunk.at.Sub(dr.start); elapsed < dr.delay {
-			effectiveDelay = elapsed
-		}
+		effectiveDelay := min(dr.delay, chunk.at.Sub(dr.start))
 		if wait := time.Until(chunk.at.Add(effectiveDelay)); wait > 0 {
 			timer := time.NewTimer(wait)
 			select {

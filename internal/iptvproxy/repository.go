@@ -86,25 +86,20 @@ func isRetryableStatus(status int) bool {
 func (u *upstreamRepository) fetchWithRetry(ctx context.Context, rawURL string, hdr http.Header) (*http.Response, error) {
 	logger := loggerFromContext(ctx, u.logger)
 	wait := retryDelay
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		resp, err := u.fetch(ctx, rawURL, hdr)
-		if err == nil {
-			if isRetryableStatus(resp.StatusCode) {
-				if attempt == maxRetries {
-					return resp, nil
-				}
-				resp.Body.Close()
-				logger.WarnContext(ctx, "upstream retryable response", "status", resp.StatusCode, "wait", wait)
-				wait = sleepWithBackoff(wait)
-				continue
+		if err != nil {
+			if !isTransientError(err) || attempt == maxRetries {
+				return nil, err
 			}
-			return resp, nil
+			logger.WarnContext(ctx, "upstream fetch failed, retrying", "attempt", attempt+1, "max_attempts", maxRetries, "wait", wait, "error", redactErr(err))
+		} else {
+			if !isRetryableStatus(resp.StatusCode) || attempt == maxRetries {
+				return resp, nil
+			}
+			resp.Body.Close()
+			logger.WarnContext(ctx, "upstream retryable response", "status", resp.StatusCode, "wait", wait)
 		}
-		if !isTransientError(err) || attempt == maxRetries {
-			return nil, err
-		}
-		logger.WarnContext(ctx, "upstream fetch failed, retrying", "attempt", attempt+1, "max_attempts", maxRetries, "wait", wait, "error", redactErr(err))
 		wait = sleepWithBackoff(wait)
 	}
-	return nil, errors.New("upstream retry loop exited unexpectedly")
 }

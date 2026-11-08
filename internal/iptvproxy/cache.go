@@ -18,7 +18,6 @@ import (
 // derived per-request.
 type singleflightCache[T any] struct {
 	ttl time.Duration
-	key string
 
 	group singleflight.Group
 
@@ -32,9 +31,9 @@ type singleflightCache[T any] struct {
 
 // newSingleflightCache builds a cache that serves a fetched value for ttl
 // before the next request triggers a fresh fetch, coalescing concurrent
-// misses via singleflight under key.
-func newSingleflightCache[T any](ttl time.Duration, key string) *singleflightCache[T] {
-	return &singleflightCache[T]{ttl: ttl, key: key}
+// misses via singleflight.
+func newSingleflightCache[T any](ttl time.Duration) *singleflightCache[T] {
+	return &singleflightCache[T]{ttl: ttl}
 }
 
 // get returns the cached value if one has been stored and is still within
@@ -58,27 +57,25 @@ func (c *singleflightCache[T]) store(v T) {
 	c.cachedAt = time.Now()
 }
 
-// backdate pushes the cached entry's timestamp back by d, so a test can make
-// it look stale without sleeping ttl.
-func (c *singleflightCache[T]) backdate(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.cachedAt = c.cachedAt.Add(-d)
-}
-
-// fetch runs fn, coalescing any other concurrent fetch call onto the same
-// invocation via the singleflight group. shared reports whether this
-// particular call rode along on another in-flight fetch rather than
-// triggering its own. It does not consult or update the cache — callers
-// combine get/fetch/store themselves (see feedService.servePlaylist) so the
-// cache-hit path can skip the singleflight group entirely.
-func (c *singleflightCache[T]) fetch(fn func() (T, error)) (result T, shared bool, err error) {
-	v, err, shared := c.group.Do(c.key, func() (any, error) {
-		return fn()
+// getOrFetch returns the cached value, or runs fn on a miss and caches its
+// result. Storing inside the flight closes the window where a request landing
+// just after the flight ended would refetch before the result was stored.
+// cached reports a cache hit; shared reports that this call rode along on
+// another in-flight fetch.
+func (c *singleflightCache[T]) getOrFetch(fn func() (T, error)) (result T, cached, shared bool, err error) {
+	if v, ok := c.get(); ok {
+		return v, true, false, nil
+	}
+	v, err, shared := c.group.Do("", func() (any, error) {
+		v, err := fn()
+		if err == nil {
+			c.store(v)
+		}
+		return v, err
 	})
 	if err != nil {
 		var zero T
-		return zero, shared, err
+		return zero, false, shared, err
 	}
-	return v.(T), shared, nil
+	return v.(T), false, shared, nil
 }

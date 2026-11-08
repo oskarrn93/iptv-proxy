@@ -49,9 +49,7 @@ var errBadShareRef = errors.New("invalid share ref")
 // sealRef encrypts an upstream URL into a URL-safe ref.
 func (sh share) sealRef(u *url.URL) string {
 	nonce := make([]byte, sh.refs.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		panic("iptvproxy: crypto/rand unavailable: " + err.Error())
-	}
+	rand.Read(nonce)
 	sealed := sh.refs.Seal(nonce, nonce, []byte(u.String()), nil)
 	return base64.RawURLEncoding.EncodeToString(sealed)
 }
@@ -77,9 +75,7 @@ func (sh share) openRef(ref string) (*url.URL, error) {
 // newShareAEAD returns AES-256-GCM under a fresh random key.
 func newShareAEAD() cipher.AEAD {
 	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		panic("iptvproxy: crypto/rand unavailable: " + err.Error())
-	}
+	rand.Read(key)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		panic("iptvproxy: aes.NewCipher: " + err.Error())
@@ -124,11 +120,12 @@ func (s *shareStore) create(feed *feedService, target *url.URL, kind sessionKind
 		ttl = maxShareTTL
 	}
 	token = randShareToken()
-	expiresAt = time.Now().Add(ttl)
+	now := time.Now()
+	expiresAt = now.Add(ttl)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.reapLocked(time.Now())
+	s.reapLocked(now)
 	s.shares[token] = share{feed: feed, target: target, kind: kind, channelName: channelName, refs: newShareAEAD(), expiresAt: expiresAt}
 	return token, expiresAt
 }
@@ -140,17 +137,9 @@ func (s *shareStore) create(feed *feedService, target *url.URL, kind sessionKind
 func (s *shareStore) lookup(token string) (sh share, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.reapLocked(time.Now())
 	sh, ok = s.shares[token]
-	if !ok {
-		return share{}, false
-	}
-	now := time.Now()
-	if now.After(sh.expiresAt) {
-		delete(s.shares, token)
-		return share{}, false
-	}
-	s.reapLocked(now)
-	return sh, true
+	return sh, ok
 }
 
 // shareInfo is a share's own state, safe to hand back to the admin page — it
@@ -205,14 +194,7 @@ func (s *shareStore) revoke(token string) bool {
 // guessing one isn't a viable attack against a link that grants access with
 // no further authentication.
 func randShareToken() string {
-	token, err := randHex(16)
-	if err != nil {
-		// crypto/rand failing means the system RNG is broken, not that this
-		// one token can't be generated — panicking here would only be traded
-		// for panicking on the next TLS handshake instead.
-		panic("iptvproxy: crypto/rand unavailable: " + err.Error())
-	}
-	return token
+	return randHex(16)
 }
 
 // shareURIWriter builds the uriWriter a share's own playlist rewrite pass

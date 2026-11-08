@@ -1,7 +1,6 @@
 package iptvproxy
 
 import (
-	"bufio"
 	"cmp"
 	_ "embed"
 	"fmt"
@@ -91,8 +90,9 @@ func (p *Proxy) handleAdminChannels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	for _, ch := range parseChannelEntries(applyBaseURL(result.body, requestBaseURL(r))) {
-		fmt.Fprintf(w, "<option value=\"%s\">%s</option>", html.EscapeString(ch.URL), html.EscapeString(ch.Name))
+	baseURL := requestBaseURL(r)
+	for _, ch := range parseChannelEntries(result.body) {
+		fmt.Fprintf(w, "<option value=\"%s\">%s</option>", html.EscapeString(applyBaseURL(ch.URL, baseURL)), html.EscapeString(ch.Name))
 	}
 }
 
@@ -140,13 +140,11 @@ type channelEntry struct {
 // which #EXTINF it follows.
 func parseChannelEntries(body string) []channelEntry {
 	var entries []channelEntry
-	scanner := bufio.NewScanner(strings.NewReader(body))
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	pendingName := ""
 	havePending := false
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for raw := range strings.Lines(body) {
+		line := strings.TrimSpace(raw)
 		switch {
 		case strings.HasPrefix(line, "#EXTINF"):
 			pendingName = extinfDisplayName(line)
