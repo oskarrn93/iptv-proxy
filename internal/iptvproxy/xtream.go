@@ -45,7 +45,7 @@ func (s *feedService) serveXtreamAPI(reqCtx context.Context, w http.ResponseWrit
 	logger := loggerFromContext(reqCtx, s.logger)
 	target := s.xtreamAPITarget(rawQuery)
 
-	tctx, cancel := s.upstreamContext(reqCtx, target)
+	tctx, cancel := context.WithTimeout(reqCtx, s.timeout)
 	defer cancel()
 
 	resp, err := s.repo.fetchWithRetry(tctx, target.String(), reqHeader)

@@ -578,6 +578,29 @@ func TestRewritePlaylist_RewritesEveryURIAttributeTag(t *testing.T) {
 	assert.Contains(t, out, "#EXT-X-MEDIA-SEQUENCE:7\n")
 }
 
+func TestServeWith_RelayOutlivesFetchTimeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// The first write has to fill serveWith's 512-byte sniff, which the
+		// fetch timeout does cover.
+		w.Header().Set("Content-Length", "1029")
+		_, _ = w.Write(bytes.Repeat([]byte("a"), 1024))
+		w.(http.Flusher).Flush()
+		time.Sleep(300 * time.Millisecond)
+		_, _ = w.Write([]byte("56789"))
+	}))
+	defer upstream.Close()
+
+	cfg := testFeedConfig(upstream.URL + "/get.php")
+	cfg.Timeout = 100 * time.Millisecond
+	s := newServiceFor(t, cfg)
+	target, _ := url.Parse(upstream.URL + "/movie/alice/secret/1.mkv")
+
+	w := httptest.NewRecorder()
+	s.serve(context.Background(), w, http.Header{}, target, "http://proxy.example.com")
+
+	assert.Equal(t, strings.Repeat("a", 1024)+"56789", w.Body.String())
+}
+
 func TestRewritePlaylist_LeavesTagsWithoutURIUnchanged(t *testing.T) {
 	s := newTestService(t, "http://upstream.example/get.php?username=u&password=p")
 	src, _ := url.Parse("http://upstream.example/live/u/p/master.m3u8")
@@ -587,4 +610,53 @@ func TestRewritePlaylist_LeavesTagsWithoutURIUnchanged(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, in, out)
+}
+
+func TestServeWith_ExtensionlessLiveKeepsOneConnection(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "video/mp2t")
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+			_, _ = w.Write(make([]byte, 1024))
+			w.(http.Flusher).Flush()
+		}
+	}))
+	t.Cleanup(srv.Close)
+	cfg := testFeedConfig(srv.URL + "/get.php?username=u&password=p")
+	cfg.Timeout = 300 * time.Millisecond
+	s := newServiceFor(t, cfg)
+	target, _ := url.Parse(srv.URL + "/live/u/p/123")
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+
+	s.serveWith(ctx, httptest.NewRecorder(), http.Header{}, target, "http://proxy", s.writeStreamURI)
+
+	assert.EqualValues(t, 1, hits.Load())
+}
+
+func TestServeWith_HungUpstreamStillTimesOut(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	cfg := testFeedConfig(srv.URL + "/get.php?username=u&password=p")
+	cfg.Timeout = 200 * time.Millisecond
+	s := newServiceFor(t, cfg)
+	target, _ := url.Parse(srv.URL + "/movie/u/p/1.mkv")
+	rec := httptest.NewRecorder()
+
+	s.serveWith(context.Background(), rec, http.Header{}, target, "http://proxy", s.writeStreamURI)
+
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
 }

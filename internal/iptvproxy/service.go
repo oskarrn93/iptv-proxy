@@ -254,16 +254,6 @@ func (s *feedService) epgTarget() *url.URL {
 	return target
 }
 
-// upstreamContext gives finite responses a deadline and leaves live TS streams
-// without one. It runs before the fetch, so the path is the only signal
-// available — hence isTSPath rather than the full isTSStream.
-func (s *feedService) upstreamContext(reqCtx context.Context, target *url.URL) (context.Context, context.CancelFunc) {
-	if isTSPath(target) {
-		return reqCtx, func() {}
-	}
-	return context.WithTimeout(reqCtx, s.timeout)
-}
-
 // groupTitlePattern extracts an #EXTINF line's group-title="..." attribute,
 // which is the only signal an Xtream m3u_plus channel list gives for which
 // category (live channel group, "Movies: <genre>", "Series: <show>") an
@@ -736,15 +726,20 @@ func (s *feedService) serve(reqCtx context.Context, w http.ResponseWriter, reqHe
 // this feed's own /stream ones.
 func (s *feedService) serveWith(reqCtx context.Context, w http.ResponseWriter, reqHeader http.Header, target *url.URL, baseURL string, writeURI uriWriter) {
 	logger := loggerFromContext(reqCtx, s.logger)
-	tctx, cancel := s.upstreamContext(reqCtx, target)
+	// A timer rather than context.WithTimeout: the deadline has to bound the
+	// fetch and any playlist read, yet stop short of a relayed body, which a
+	// context deadline would cut off mid-movie.
+	fetchCtx, cancel := context.WithCancel(reqCtx)
 	defer cancel()
-	resp, err := s.repo.fetchWithRetry(tctx, target.String(), reqHeader)
+	deadline := time.AfterFunc(s.timeout, cancel)
+
+	resp, err := s.repo.fetchWithRetry(fetchCtx, target.String(), reqHeader)
 	if err != nil {
-		// context.Canceled here means the viewer gave up (closed the
-		// connection, or an app bulk-validating the whole channel list moved
-		// on) before the upstream responded — not an upstream failure, so it
-		// shouldn't count toward upstream error metrics or alert-worthy logs.
-		if errors.Is(err, context.Canceled) {
+		// reqCtx being done means the viewer gave up (closed the connection,
+		// or an app bulk-validating the whole channel list moved on) before
+		// the upstream responded — not an upstream failure, so it shouldn't
+		// count toward upstream error metrics or alert-worthy logs.
+		if reqCtx.Err() != nil {
 			logger.InfoContext(reqCtx, "stream request canceled: client disconnected")
 			return
 		}
@@ -771,6 +766,8 @@ func (s *feedService) serveWith(reqCtx context.Context, w http.ResponseWriter, r
 		writePlaylistResponse(w, result, baseURL)
 		return
 	}
+
+	deadline.Stop()
 
 	// A body of known length is finite — an HLS segment or a ranged VOD chunk —
 	// so it is copied once. Only an unbounded body (chunked/EOF-delimited) is a
