@@ -33,7 +33,7 @@ func testFeedConfig(upstream string) FeedConfig {
 // it's specifically exercising the delay buffer — most tests assert on
 // timing or exact byte sequences that a several-second delay would make slow
 // or awkward to express.
-var disabledClientBuffer = ClientBufferConfig{Enabled: boolPtr(false)}
+var disabledClientBuffer = ClientBufferConfig{Enabled: new(false)}
 
 // buildService constructs a feedService from cfg, wiring up the repository,
 // logger, and metrics every caller would otherwise spell out identically.
@@ -553,3 +553,11 @@ func (f *flushRecorder) WriteHeader(status int) {
 }
 
 func (f *flushRecorder) Flush() {}
+
+// backdate pushes the cached entry's timestamp back by d, so a test can make
+// it look stale without sleeping ttl.
+func (c *singleflightCache[T]) backdate(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cachedAt = c.cachedAt.Add(-d)
+}

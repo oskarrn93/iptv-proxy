@@ -88,10 +88,6 @@ func firstForwarded(v string) string {
 	return strings.TrimSpace(first)
 }
 
-// boolPtr returns a pointer to b, for building a *bool config field (e.g.
-// ClientBufferConfig.Enabled) inline where Go doesn't allow &false directly.
-func boolPtr(b bool) *bool { return &b }
-
 // lowercaseAll lowercases each string in ss, so a case-insensitive prefix
 // list only needs its comparisons done once at config-load time rather than
 // once per playlist line.
@@ -188,27 +184,20 @@ func bufferedCopy(w http.ResponseWriter, r io.Reader, lastChunk *[]byte) (int64,
 	}
 }
 
-// randHex returns n random bytes hex-encoded, or an error if the system RNG
-// (crypto/rand) can't be read — the shared primitive behind every unguessable
+// randHex returns n random bytes hex-encoded — the shared primitive behind every unguessable
 // token this package hands out (request ids, share tokens), so they don't
 // each reimplement the same rand.Read+hex.EncodeToString pair.
-func randHex(n int) (string, error) {
+func randHex(n int) string {
 	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 // newRequestID returns a short unguessable id for tagging every log line
 // produced while handling one request, so they can be grepped/grouped
 // together (e.g. "request_id=a1b2c3d4e5f6a7b8").
 func newRequestID() string {
-	id, err := randHex(8)
-	if err != nil {
-		panic("faild to generate request id: " + err.Error())
-	}
-	return id
+	return randHex(8)
 }
 
 type readCloserWrapper struct {
@@ -223,13 +212,6 @@ type readCloserWrapper struct {
 // reconnect loop.
 func sleepWithBackoff(wait time.Duration) time.Duration {
 	jitter := time.Duration(mrand.Int63n(int64(wait/2 + time.Millisecond)))
-	delay := wait + jitter
-	if delay > maxRetryDelay {
-		delay = maxRetryDelay
-	}
-	time.Sleep(delay)
-	if next := wait * 2; next < maxRetryDelay {
-		return next
-	}
-	return maxRetryDelay
+	time.Sleep(min(wait+jitter, maxRetryDelay))
+	return min(wait*2, maxRetryDelay)
 }

@@ -2,6 +2,7 @@ package iptvproxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,23 +18,12 @@ import (
 
 const maxReconnects = 3
 
-// playlistGroupKey is the singleflight.Group key for a feed's top-level
-// playlist fetch. A feedService has exactly one playlist target (its
-// configured upstream_url), so every call coalesces under this one constant
-// key rather than one derived per-request.
-const playlistGroupKey = "playlist"
-
 // playlistCacheTTL is how long a successfully fetched playlist is served from
 // memory before the next request triggers a fresh upstream fetch. IPTV apps
 // poll the playlist every few seconds but a channel list changes rarely, so
 // this trades staleness (up to the TTL) for cutting upstream load from "once
 // per poll" to "once per TTL" per feed.
 const playlistCacheTTL = 3 * time.Hour
-
-// epgGroupKey is the singleflight.Group key for a feed's EPG fetch, mirroring
-// playlistGroupKey: a feedService has exactly one EPG target (its upstream's
-// xmltv.php), so every call coalesces under this one constant key.
-const epgGroupKey = "epg"
 
 // epgCacheTTL is how long a fetched XMLTV guide is served from memory before
 // the next request triggers a fresh upstream fetch. An EPG guide is tens of
@@ -224,8 +214,8 @@ func newFeedService(cfg FeedConfig, repo *upstreamRepository, logger *slog.Logge
 		repo:                 repo,
 		logger:               logger,
 		metrics:              metrics,
-		playlistCache:        newSingleflightCache[playlistFetchResult](playlistCacheTTL, playlistGroupKey),
-		epgCache:             newSingleflightCache[epgFetchResult](epgCacheTTL, epgGroupKey),
+		playlistCache:        newSingleflightCache[playlistFetchResult](playlistCacheTTL),
+		epgCache:             newSingleflightCache[epgFetchResult](epgCacheTTL),
 		clientBufferDelay:    clientBufferDelay,
 		liveTargets:          newLiveTargetTracker(),
 	}, nil
@@ -327,11 +317,7 @@ func (s *feedService) rewritePlaylist(r io.Reader, srcURL *url.URL, sizeHint int
 	// of an Xtream m3u_plus list, and a 40 MB upstream that rewrites down to
 	// 2 MB shouldn't open with a 50 MB allocation.
 	if sizeHint > 0 {
-		grow := sizeHint + sizeHint/4
-		if grow > maxPlaylistGrow {
-			grow = maxPlaylistGrow
-		}
-		out.Grow(int(grow))
+		out.Grow(int(min(sizeHint+sizeHint/4, maxPlaylistGrow)))
 	}
 
 	// skipURI is set by an excluded #EXTINF line so the URI line that follows
@@ -489,22 +475,16 @@ func streamURIPathParts(path string, creds Credentials) (prefix, rest string) {
 	return fallbackStreamPrefix, trimmed
 }
 
-// vodStreamPrefixes are the Xtream path prefixes streamURIPathParts emits for
-// on-demand content (movie/series), as opposed to a live channel. Used to
-// classify a /stream request's sessionKind from its prefix alone, before
-// anything is fetched from upstream.
-var vodStreamPrefixes = map[string]bool{"movie": true, "series": true}
-
 // classifySessionKind reports what kind of /stream request prefix identifies,
 // for the activeSessions gauge. bareCredsStreamPrefix and the standard "live"
 // prefix are both live channels; movie/series are VOD; anything else
 // (timeshift, catch-up, or a non-standard upstream shape via
 // fallbackStreamPrefix) is bucketed as "other" rather than guessed at.
 func classifySessionKind(prefix string) sessionKind {
-	switch {
-	case prefix == "live" || prefix == bareCredsStreamPrefix:
+	switch prefix {
+	case "live", bareCredsStreamPrefix:
 		return sessionKindLive
-	case vodStreamPrefixes[prefix]:
+	case "movie", "series":
 		return sessionKindVOD
 	default:
 		return sessionKindOther
@@ -553,7 +533,7 @@ func rewriteAttrURI(line string, base *url.URL, writeURI uriWriter) string {
 }
 
 // fetchPlaylist fetches and rewrites this feed's top-level playlist. It is
-// only ever called from inside playlistGroup.Do, so it must not write to any
+// only ever called from inside playlistCache's flight, so it must not write to any
 // particular caller's http.ResponseWriter — its result is handed out to every
 // request that coalesced onto the same call. For the same reason it fetches
 // with a context detached from any single caller: a coalesced leader whose
@@ -565,7 +545,7 @@ func (s *feedService) fetchPlaylist(reqHeader http.Header) (playlistFetchResult,
 
 	resp, err := s.repo.fetchWithRetry(tctx, s.target.String(), reqHeader)
 	if err != nil {
-		return playlistFetchResult{}, s.upstreamFailure(tctx, s.target, err)
+		return playlistFetchResult{}, s.upstreamFailure(tctx, err)
 	}
 	defer resp.Body.Close()
 
@@ -579,7 +559,7 @@ func (s *feedService) fetchPlaylist(reqHeader http.Header) (playlistFetchResult,
 // error the caller should report it as. err wraps the full upstream URL,
 // Xtream credentials included, so it is logged (redacted) rather than returned
 // to the client.
-func (s *feedService) upstreamFailure(ctx context.Context, target *url.URL, err error) *playlistFetchError {
+func (s *feedService) upstreamFailure(ctx context.Context, err error) *playlistFetchError {
 	loggerFromContext(ctx, s.logger).ErrorContext(ctx, "upstream fetch failed", "error", redactErr(err))
 	s.metrics.recordUpstreamError(errorKindFetchFailed)
 	return &playlistFetchError{status: http.StatusBadGateway, msg: "upstream fetch failed"}
@@ -628,7 +608,7 @@ func (s *feedService) fetchEPG() (epgFetchResult, error) {
 	target := s.epgTarget()
 	resp, err := s.repo.fetchWithRetry(tctx, target.String(), nil)
 	if err != nil {
-		return epgFetchResult{}, s.upstreamFailure(tctx, target, err)
+		return epgFetchResult{}, s.upstreamFailure(tctx, err)
 	}
 	defer resp.Body.Close()
 
@@ -646,7 +626,9 @@ func (s *feedService) fetchEPG() (epgFetchResult, error) {
 	if contentType == "" {
 		contentType = "application/xml"
 	}
-	return epgFetchResult{body: body, status: resp.StatusCode, contentType: contentType}, nil
+	// Clone drops ReadAll's spare capacity, which would otherwise stay pinned
+	// for the whole epgCacheTTL.
+	return epgFetchResult{body: bytes.Clone(body), status: resp.StatusCode, contentType: contentType}, nil
 }
 
 // writeEPGResponse writes a fetched (or cached) EPG result to w verbatim — an
@@ -662,26 +644,19 @@ func writeEPGResponse(w http.ResponseWriter, result epgFetchResult) {
 // serveEPG serves this feed's XMLTV guide, following the same
 // cache-then-coalesce shape as servePlaylist: a request within epgCacheTTL of
 // the last successful upstream fetch is served straight from that cache;
-// otherwise it coalesces onto a single upstream fetch via epgGroup, shared
-// with any other request racing it for the same refresh.
+// otherwise it coalesces onto a single upstream fetch, shared with any other
+// request racing it for the same refresh.
 func (s *feedService) serveEPG(reqCtx context.Context, w http.ResponseWriter) {
 	logger := loggerFromContext(reqCtx, s.logger)
 
-	if result, ok := s.epgCache.get(); ok {
-		logger.InfoContext(reqCtx, "epg fetch", "cached", true)
-		writeEPGResponse(w, result)
-		return
-	}
-
-	result, shared, err := s.epgCache.fetch(s.fetchEPG)
-	logger.InfoContext(reqCtx, "epg fetch", "cached", false, "coalesced", shared)
+	result, cached, shared, err := s.epgCache.getOrFetch(s.fetchEPG)
+	logger.InfoContext(reqCtx, "epg fetch", "cached", cached, "coalesced", shared)
 
 	if err != nil {
 		writeUpstreamError(w, err)
 		return
 	}
 
-	s.epgCache.store(result)
 	writeEPGResponse(w, result)
 }
 
@@ -706,15 +681,24 @@ func writePlaylistResponse(w http.ResponseWriter, result playlistFetchResult, ba
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(result.status)
-	io.WriteString(w, applyBaseURL(result.body, baseURL))
+	// Written piecewise rather than via applyBaseURL so a poll doesn't copy the
+	// whole cached body.
+	body := result.body
+	for {
+		before, after, found := strings.Cut(body, baseURLPlaceholder)
+		io.WriteString(w, before)
+		if !found {
+			return
+		}
+		io.WriteString(w, baseURL)
+		body = after
+	}
 }
 
 // servePlaylist serves this feed's top-level playlist. A request within
 // playlistCacheTTL of the last successful upstream fetch is served straight
-// from that cache; otherwise it coalesces onto a single upstream fetch via
-// playlistGroup, shared with any other request racing it for the same
-// refresh. shared reports whether this particular call rode along on another
-// in-flight fetch rather than triggering its own.
+// from that cache; otherwise it coalesces onto a single upstream fetch, shared
+// with any other request racing it for the same refresh.
 func (s *feedService) servePlaylist(reqCtx context.Context, w http.ResponseWriter, reqHeader http.Header, baseURL string) {
 	result, err := s.getPlaylist(reqCtx, reqHeader)
 	if err != nil {
@@ -731,22 +715,11 @@ func (s *feedService) servePlaylist(reqCtx context.Context, w http.ResponseWrite
 func (s *feedService) getPlaylist(reqCtx context.Context, reqHeader http.Header) (playlistFetchResult, error) {
 	logger := loggerFromContext(reqCtx, s.logger)
 
-	if result, ok := s.playlistCache.get(); ok {
-		logger.InfoContext(reqCtx, "playlist fetch", "cached", true)
-		return result, nil
-	}
-
-	result, shared, err := s.playlistCache.fetch(func() (playlistFetchResult, error) {
+	result, cached, shared, err := s.playlistCache.getOrFetch(func() (playlistFetchResult, error) {
 		return s.fetchPlaylist(reqHeader)
 	})
-	logger.InfoContext(reqCtx, "playlist fetch", "cached", false, "coalesced", shared)
-
-	if err != nil {
-		return playlistFetchResult{}, err
-	}
-
-	s.playlistCache.store(result)
-	return result, nil
+	logger.InfoContext(reqCtx, "playlist fetch", "cached", cached, "coalesced", shared)
+	return result, err
 }
 
 // serve fetches target through the repository and writes the appropriate
@@ -775,7 +748,7 @@ func (s *feedService) serveWith(reqCtx context.Context, w http.ResponseWriter, r
 			logger.InfoContext(reqCtx, "stream request canceled: client disconnected")
 			return
 		}
-		writeUpstreamError(w, s.upstreamFailure(reqCtx, target, err))
+		writeUpstreamError(w, s.upstreamFailure(reqCtx, err))
 		return
 	}
 	defer resp.Body.Close()

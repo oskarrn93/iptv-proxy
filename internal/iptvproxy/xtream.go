@@ -50,7 +50,7 @@ func (s *feedService) serveXtreamAPI(reqCtx context.Context, w http.ResponseWrit
 
 	resp, err := s.repo.fetchWithRetry(tctx, target.String(), reqHeader)
 	if err != nil {
-		writeUpstreamError(w, s.upstreamFailure(tctx, target, err))
+		writeUpstreamError(w, s.upstreamFailure(tctx, err))
 		return
 	}
 	defer resp.Body.Close()
