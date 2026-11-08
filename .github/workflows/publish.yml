@@ -11,6 +11,32 @@ permissions:
   contents: read
 
 jobs:
+  binaries:
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            name="iptv-proxy_${GITHUB_REF_NAME}_${target%/*}_${target#*/}"
+            mkdir -p "dist/$name"
+            CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" \
+              go build -trimpath -ldflags="-s -w" -o "dist/$name/iptv-proxy" ./cmd/iptv-proxy
+            cp config.yaml.example "dist/$name/"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+          done
+          cd dist && sha256sum ./*.tar.gz > checksums.txt
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/checksums.txt --clobber
+
   image:
     if: ${{ github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
