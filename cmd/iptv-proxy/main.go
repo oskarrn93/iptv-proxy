@@ -26,7 +26,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/oskarrn93/media-services/iptv-proxy/internal/iptvproxy"
+	"github.com/oskarrn93/iptv-proxy/internal/iptvproxy"
 )
 
 func main() {

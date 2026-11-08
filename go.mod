@@ -1,4 +1,4 @@
-module github.com/oskarrn93/media-services/iptv-proxy
+module github.com/oskarrn93/iptv-proxy
 
 go 1.27.1
 
