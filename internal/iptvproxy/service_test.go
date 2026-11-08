@@ -578,6 +578,30 @@ func TestRewritePlaylist_RewritesEveryURIAttributeTag(t *testing.T) {
 	assert.Contains(t, out, "#EXT-X-MEDIA-SEQUENCE:7\n")
 }
 
+func TestServePlaylist_ServesStaleWhenRefreshFails(t *testing.T) {
+	var failing atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if failing.Load() {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write([]byte("#EXTM3U\nsegment1.ts\n"))
+	}))
+	defer upstream.Close()
+
+	s := newTestService(t, upstream.URL+"/get.php")
+	s.servePlaylist(context.Background(), httptest.NewRecorder(), http.Header{}, "http://proxy.example.com")
+
+	failing.Store(true)
+	s.playlistCache.backdate(playlistCacheTTL + time.Second)
+
+	w := httptest.NewRecorder()
+	s.servePlaylist(context.Background(), w, http.Header{}, "http://proxy.example.com")
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "#EXTM3U")
+}
+
 func TestServeWith_RelayOutlivesFetchTimeout(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// The first write has to fill serveWith's 512-byte sniff, which the
