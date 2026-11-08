@@ -195,7 +195,7 @@ func TestHandleRevokeShare_DropsShareImmediately(t *testing.T) {
 	rec := httptest.NewRecorder()
 	p.handleRevokeShare(rec, req)
 
-	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Equal(t, http.StatusOK, rec.Code)
 	_, ok := p.shares.lookup(token)
 	assert.False(t, ok, "a revoked share must no longer be servable")
 }

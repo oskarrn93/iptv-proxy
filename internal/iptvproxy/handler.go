@@ -436,5 +436,7 @@ func (p *Proxy) handleRevokeShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logger.InfoContext(r.Context(), "share revoked")
-	w.WriteHeader(http.StatusNoContent)
+	// 200 with an empty body, not 204: htmx doesn't swap on a 204, which would
+	// leave the revoked row on the admin page.
+	w.WriteHeader(http.StatusOK)
 }
