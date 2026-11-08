@@ -29,6 +29,8 @@ type Proxy struct {
 	// trust decides whose X-Forwarded-* headers count and who may reach
 	// /admin/* (see trust.go).
 	trust trustPolicy
+	// adminAuth is the optional /admin/* login (see adminOnly).
+	adminAuth *Credentials
 }
 
 func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, error) {
@@ -36,9 +38,9 @@ func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, er
 	if err != nil {
 		return nil, fmt.Errorf("trust config: %w", err)
 	}
-	p := &Proxy{logger: logger, shares: newShareStore(), trust: trust}
-	if len(cfg.AdminAllowedCIDRs) == 0 || len(cfg.TrustedProxies) == 0 {
-		logger.Warn("admin UI disabled: set trusted_proxies and admin_allowed_cidrs in config.yaml to enable it")
+	p := &Proxy{logger: logger, shares: newShareStore(), trust: trust, adminAuth: cfg.AdminAuth}
+	if len(cfg.AdminAllowedCIDRs) == 0 || (len(cfg.TrustedProxies) == 0 && cfg.AdminAuth == nil) {
+		logger.Warn("admin UI disabled: set admin_allowed_cidrs and either trusted_proxies or admin_auth in config.yaml to enable it")
 	}
 
 	// Gatherers merges every feed's own registry into one /metrics response
