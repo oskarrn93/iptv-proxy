@@ -1,7 +1,7 @@
 # admin_ui_test
 
-Playwright regression tests for `../admin.html`'s feed/channel combobox
-JavaScript, run against the real file in a real Chromium — see
+Playwright regression tests for the admin UI (`../admin.html` and
+`../static/admin.js`), run against the real files in a real Chromium — see
 `admin.test.js`'s file comment for what specifically these guard against and
 why (the pre-select-without-firing-`change` bug, and the focus-re-filters
 -by-stale-text bug).
@@ -16,6 +16,18 @@ npm test
 ```
 
 Also documented in `../../CLAUDE.md`.
+
+## Screenshots
+
+`screenshots.test.js` compares the page against the baselines in
+`docs/screenshots`, which are also the images the README shows. After an
+intended UI change, regenerate them on macOS:
+
+```sh
+npm run screenshots
+```
+
+CI skips these tests (`@visual`) because fonts render differently on Linux.
 
 ## No CDN, no network
 

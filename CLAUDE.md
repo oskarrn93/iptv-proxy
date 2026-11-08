@@ -32,7 +32,7 @@ go test ./...
 go vet ./...
 ```
 
-`internal/iptvproxy/admin.html`'s feed/channel combobox JS has its own Playwright regression suite (real Chromium, real admin.html, no live server needed — see `internal/iptvproxy/admin_ui_test/README.md`):
+The admin UI is `internal/iptvproxy/admin.html` (page markup), `static/admin.css` and `static/admin.js` (its style and behavior), and `admin_fragments.html` (the templates `/admin/*` returns for htmx to swap). It has its own Playwright suite (real Chromium, no live server needed — see `internal/iptvproxy/admin_ui_test/README.md`). `npm run screenshots` regenerates the README images in `docs/screenshots`:
 
 ```sh
 cd internal/iptvproxy/admin_ui_test && npm ci && npx playwright install chromium && npm test
