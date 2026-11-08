@@ -57,9 +57,18 @@ func (c *singleflightCache[T]) store(v T) {
 	c.cachedAt = time.Now()
 }
 
+// lastStored returns the most recently stored value regardless of age.
+func (c *singleflightCache[T]) lastStored() (T, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.value, !c.cachedAt.IsZero()
+}
+
 // getOrFetch returns the cached value, or runs fn on a miss and caches its
-// result. Storing inside the flight closes the window where a request landing
-// just after the flight ended would refetch before the result was stored.
+// result. If fn fails it falls back to the last stored value however old, so
+// an upstream outage doesn't take down a feed that was serving fine. Storing
+// inside the flight closes the window where a request landing just after the
+// flight ended would refetch before the result was stored.
 // cached reports a cache hit; shared reports that this call rode along on
 // another in-flight fetch.
 func (c *singleflightCache[T]) getOrFetch(fn func() (T, error)) (result T, cached, shared bool, err error) {
@@ -70,6 +79,10 @@ func (c *singleflightCache[T]) getOrFetch(fn func() (T, error)) (result T, cache
 		v, err := fn()
 		if err == nil {
 			c.store(v)
+			return v, nil
+		}
+		if stale, ok := c.lastStored(); ok {
+			return stale, nil
 		}
 		return v, err
 	})
