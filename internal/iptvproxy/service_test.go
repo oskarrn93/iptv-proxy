@@ -561,3 +561,30 @@ func (c *singleflightCache[T]) backdate(d time.Duration) {
 	defer c.mu.Unlock()
 	c.cachedAt = c.cachedAt.Add(-d)
 }
+
+func TestRewritePlaylist_RewritesEveryURIAttributeTag(t *testing.T) {
+	s := newTestService(t, "http://upstream.example.com/get.php")
+	src, _ := url.Parse("http://upstream.example.com/hls/master.m3u8")
+	body := "#EXTM3U\n" +
+		`#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="en",URI="audio/en.m3u8"` + "\n" +
+		`#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1,URI="http://upstream.example.com/iframe.m3u8"` + "\n" +
+		"#EXT-X-MEDIA-SEQUENCE:7\n"
+
+	out, err := rewriteBody(s, []byte(body), src)
+
+	require.NoError(t, err)
+	assert.NotContains(t, out, "upstream.example.com")
+	assert.NotContains(t, out, `URI="audio/en.m3u8"`)
+	assert.Contains(t, out, "#EXT-X-MEDIA-SEQUENCE:7\n")
+}
+
+func TestRewritePlaylist_LeavesTagsWithoutURIUnchanged(t *testing.T) {
+	s := newTestService(t, "http://upstream.example/get.php?username=u&password=p")
+	src, _ := url.Parse("http://upstream.example/live/u/p/master.m3u8")
+	in := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS=\"avc1\"\n"
+
+	out, err := rewriteBody(s, []byte(in), src)
+
+	require.NoError(t, err)
+	assert.Equal(t, in, out)
+}
