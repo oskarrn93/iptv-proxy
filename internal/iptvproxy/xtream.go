@@ -29,6 +29,14 @@ const xtreamAPIPath = "/player_api.php"
 // receives a path beyond the endpoint itself.
 func (s *feedService) xtreamAPITarget(rawQuery string) *url.URL {
 	_, query := s.restoreCredentials.apply("", rawQuery)
+	// A client that authenticated with Basic Auth has no credentials in its
+	// query for the swap to restore, and the upstream only reads them there.
+	values, _ := url.ParseQuery(query)
+	if !values.Has("username") && !values.Has("password") && s.upstreamCreds != (Credentials{}) {
+		values.Set("username", s.upstreamCreds.Username)
+		values.Set("password", s.upstreamCreds.Password)
+		query = values.Encode()
+	}
 	return &url.URL{Scheme: s.target.Scheme, Host: s.target.Host, Path: xtreamAPIPath, RawQuery: query}
 }
 
@@ -60,10 +68,18 @@ func (s *feedService) serveXtreamAPI(reqCtx context.Context, w http.ResponseWrit
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxXtreamAPIBody))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxXtreamAPIBody+1))
 	if err != nil {
 		logger.ErrorContext(reqCtx, "xtream api read failed", "error", redactErr(err))
 		writeUpstreamError(w, &playlistFetchError{status: http.StatusBadGateway, msg: "read failed"})
+		return
+	}
+
+	// Truncated JSON would fail to parse and take the unrewritten passthrough
+	// below, handing the client whatever upstream URLs it holds.
+	if len(body) > maxXtreamAPIBody {
+		logger.ErrorContext(reqCtx, "xtream api response too large to rewrite", "limit", maxXtreamAPIBody)
+		writeUpstreamError(w, &playlistFetchError{status: http.StatusBadGateway, msg: "upstream response too large"})
 		return
 	}
 
