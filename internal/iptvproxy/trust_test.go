@@ -3,6 +3,7 @@ package iptvproxy
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -90,4 +91,92 @@ func TestStripUntrustedForwarded(t *testing.T) {
 func TestNewTrustPolicy_RejectsBadCIDR(t *testing.T) {
 	_, err := newTrustPolicy([]string{"not-a-cidr"}, nil)
 	assert.Error(t, err)
+}
+
+func TestAdminOnly_WithBasicAuth(t *testing.T) {
+	p := newTrustedTestProxy(t)
+	p.adminAuth = &Credentials{Username: "admin", Password: "hunter2"}
+	mux := p.Mux()
+	const (
+		lanDirect = "192.168.1.50:40000"
+		proxy     = "172.30.0.9:40000"
+	)
+
+	cases := []struct {
+		name       string
+		remoteAddr string
+		xff        string
+		user, pass string
+		want       int
+	}{
+		{"LAN client direct with login", lanDirect, "", "admin", "hunter2", http.StatusOK},
+		{"LAN client direct without login", lanDirect, "", "", "", http.StatusUnauthorized},
+		{"wrong password", lanDirect, "", "admin", "wrong", http.StatusUnauthorized},
+		{"wrong username", lanDirect, "", "root", "hunter2", http.StatusUnauthorized},
+		{"public client direct with login", "203.0.113.7:40000", "", "admin", "hunter2", http.StatusForbidden},
+		{"public client forging X-Forwarded-For", "203.0.113.7:40000", "192.168.1.50", "admin", "hunter2", http.StatusForbidden},
+		{"LAN client via proxy with login", proxy, "192.168.1.50", "admin", "hunter2", http.StatusOK},
+		{"LAN client via proxy without login", proxy, "192.168.1.50", "", "", http.StatusUnauthorized},
+		{"public client via proxy with login", proxy, "203.0.113.7", "admin", "hunter2", http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := adminRequest(tc.remoteAddr, tc.xff)
+			if tc.user != "" {
+				req.SetBasicAuth(tc.user, tc.pass)
+			}
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			assert.Equal(t, tc.want, rec.Code)
+			if tc.want == http.StatusUnauthorized {
+				assert.Contains(t, rec.Header().Get("WWW-Authenticate"), "Basic")
+			}
+		})
+	}
+}
+
+func TestAdminOnly_BasicAuthStillNeedsAllowedCIDRs(t *testing.T) {
+	p := newTestProxy(t, "http://upstream.example.com/get.php")
+	p.adminAuth = &Credentials{Username: "admin", Password: "hunter2"}
+	req := adminRequest("127.0.0.1:40000", "")
+	req.SetBasicAuth("admin", "hunter2")
+	rec := httptest.NewRecorder()
+
+	p.Mux().ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+// A browser attaches Basic credentials to cross-site requests by itself, so a
+// valid login alone must not let another website change shares.
+func TestAdminOnly_RejectsCrossSiteWrites(t *testing.T) {
+	p := newTrustedTestProxy(t)
+	p.adminAuth = &Credentials{Username: "admin", Password: "hunter2"}
+	mux := p.Mux()
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		site   string
+		want   int
+	}{
+		{"cross-site create", http.MethodPost, "/admin/shares", "cross-site", http.StatusForbidden},
+		{"cross-site revoke", http.MethodDelete, "/admin/shares/abc", "cross-site", http.StatusForbidden},
+		{"same-origin create reaches the handler", http.MethodPost, "/admin/shares", "same-origin", http.StatusBadRequest},
+		{"non-browser client reaches the handler", http.MethodPost, "/admin/shares", "", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader("not json"))
+			req.RemoteAddr = "192.168.1.50:40000"
+			req.SetBasicAuth("admin", "hunter2")
+			if tc.site != "" {
+				req.Header.Set("Sec-Fetch-Site", tc.site)
+			}
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			assert.Equal(t, tc.want, rec.Code)
+		})
+	}
 }

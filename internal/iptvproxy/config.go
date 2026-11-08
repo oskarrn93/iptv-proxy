@@ -33,9 +33,12 @@ type Config struct {
 	// those headers stripped. Empty trusts no one.
 	TrustedProxies []string `yaml:"trusted_proxies" validate:"dive,cidr"`
 	// AdminAllowedCIDRs lists the original client addresses allowed to reach
-	// /admin/*, which additionally must arrive via a trusted proxy. Empty
-	// disables the admin UI entirely.
+	// /admin/*, which additionally must arrive via a trusted proxy unless
+	// AdminAuth is set. Empty disables the admin UI entirely.
 	AdminAllowedCIDRs []string `yaml:"admin_allowed_cidrs" validate:"dive,cidr"`
+	// AdminAuth requires this HTTP Basic login on every /admin/* request, for
+	// running without an authenticating reverse proxy.
+	AdminAuth *Credentials `yaml:"admin_auth"`
 }
 
 // defaultClientBufferDuration is how long a live TS stream is held back from
