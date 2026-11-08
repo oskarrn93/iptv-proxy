@@ -47,6 +47,15 @@ var forwardedRequestHeaders = []string{"Range", "If-Range", "Accept", "User-Agen
 // non-playlist bodies so ranged/seekable responses stay intact.
 var forwardedResponseHeaders = []string{"Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"}
 
+// withoutRange returns hdr minus its range headers, for a fetch that needs the
+// whole resource rather than the slice one client happened to ask for.
+func withoutRange(hdr http.Header) http.Header {
+	hdr = hdr.Clone()
+	hdr.Del("Range")
+	hdr.Del("If-Range")
+	return hdr
+}
+
 // requestBaseURL derives the scheme://host a client actually reached this
 // proxy at, from the request alone — so a rewritten playlist's links can be
 // made absolute without any configured public_base_url. X-Forwarded-Host/

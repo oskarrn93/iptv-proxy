@@ -3,6 +3,7 @@ package iptvproxy
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -578,6 +579,38 @@ func TestRewritePlaylist_RewritesEveryURIAttributeTag(t *testing.T) {
 	assert.Contains(t, out, "#EXT-X-MEDIA-SEQUENCE:7\n")
 }
 
+func TestServePlaylist_ResolvesRelativeURIsAgainstRedirectedURL(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/get.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/hls/abc/index.m3u8", http.StatusFound)
+	})
+	mux.HandleFunc("/hls/abc/index.m3u8", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("#EXTM3U\nseg1.ts\n"))
+	})
+	upstream := httptest.NewServer(mux)
+	defer upstream.Close()
+
+	s := newTestService(t, upstream.URL+"/get.php")
+	w := httptest.NewRecorder()
+	s.servePlaylist(context.Background(), w, http.Header{}, "http://proxy.example.com")
+
+	assert.Contains(t, w.Body.String(), "/hls/abc/seg1.ts")
+}
+
+func TestServePlaylist_DoesNotForwardClientRange(t *testing.T) {
+	var gotRange atomic.Value
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRange.Store(r.Header.Get("Range"))
+		_, _ = w.Write([]byte("#EXTM3U\nsegment1.ts\n"))
+	}))
+	defer upstream.Close()
+
+	s := newTestService(t, upstream.URL+"/get.php")
+	s.servePlaylist(context.Background(), httptest.NewRecorder(), http.Header{"Range": {"bytes=0-5"}}, "http://proxy.example.com")
+
+	assert.Equal(t, "", gotRange.Load())
+}
+
 func TestServePlaylist_ServesStaleWhenRefreshFails(t *testing.T) {
 	var failing atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -623,6 +656,35 @@ func TestServeWith_RelayOutlivesFetchTimeout(t *testing.T) {
 	s.serve(context.Background(), w, http.Header{}, target, "http://proxy.example.com")
 
 	assert.Equal(t, strings.Repeat("a", 1024)+"56789", w.Body.String())
+}
+
+func TestStreamWithReconnect_StopsOnErrorStatus(t *testing.T) {
+	var hits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		http.Error(w, "subscription expired", http.StatusForbidden)
+	}))
+	defer upstream.Close()
+
+	s := newTestService(t, upstream.URL+"/get.php")
+	target, _ := url.Parse(upstream.URL + "/live/alice/secret/1.ts")
+
+	w := httptest.NewRecorder()
+	err := s.streamWithReconnect(context.Background(), w, http.Header{}, target, io.NopCloser(strings.NewReader("data")))
+
+	require.Error(t, err)
+	assert.NotContains(t, w.Body.String(), "subscription expired")
+	assert.Equal(t, int64(1), hits.Load())
+}
+
+func TestRedactedTarget_HidesPathCredentials(t *testing.T) {
+	s := newTestService(t, "http://upstream.example.com/get.php?username=upuser&password=uppass")
+	target, _ := url.Parse("http://upstream.example.com/live/upuser/uppass/1.ts")
+
+	out := s.redactedTarget(target)
+
+	assert.NotContains(t, out, "upuser")
+	assert.NotContains(t, out, "uppass")
 }
 
 func TestRewritePlaylist_LeavesTagsWithoutURIUnchanged(t *testing.T) {

@@ -170,9 +170,9 @@ func (p pipeResponseWriter) WriteHeader(int)             {}
 // own reconnect/gap-bridging logic is unchanged) and a delayedReader between
 // that pipe and the real client absorbs upstream hiccups shorter than the
 // configured duration before they ever reach the client.
-func (s *feedService) streamLive(ctx context.Context, w http.ResponseWriter, target *url.URL, initialBody io.ReadCloser) error {
+func (s *feedService) streamLive(ctx context.Context, w http.ResponseWriter, reqHeader http.Header, target *url.URL, initialBody io.ReadCloser) error {
 	if s.clientBufferDelay == nil {
-		return s.streamWithReconnect(ctx, w, target, initialBody)
+		return s.streamWithReconnect(ctx, w, reqHeader, target, initialBody)
 	}
 
 	// producerCtx is canceled as soon as this function stops reading from the
@@ -185,7 +185,7 @@ func (s *feedService) streamLive(ctx context.Context, w http.ResponseWriter, tar
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
 	go func() {
-		err := s.streamWithReconnect(producerCtx, pipeResponseWriter{pw}, target, initialBody)
+		err := s.streamWithReconnect(producerCtx, pipeResponseWriter{pw}, reqHeader, target, initialBody)
 		pw.CloseWithError(err)
 		errCh <- err
 	}()

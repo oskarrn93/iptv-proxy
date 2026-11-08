@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -54,7 +55,14 @@ func (u *upstreamRepository) fetch(ctx context.Context, rawURL string, hdr http.
 			req.Header.Set(name, v)
 		}
 	}
-	return u.client.Do(req)
+	resp, err := u.client.Do(req)
+	// *url.Error embeds the request URL, and an Xtream URL carries the
+	// upstream's credentials in its path, where redact can't recognize them.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return nil, urlErr.Err
+	}
+	return resp, err
 }
 
 func isTransientError(err error) bool {

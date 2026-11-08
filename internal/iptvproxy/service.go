@@ -533,7 +533,9 @@ func (s *feedService) fetchPlaylist(reqHeader http.Header) (playlistFetchResult,
 	tctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
-	resp, err := s.repo.fetchWithRetry(tctx, s.target.String(), reqHeader)
+	// One client's Range must not become the partial body every viewer is
+	// served from the cache.
+	resp, err := s.repo.fetchWithRetry(tctx, s.target.String(), withoutRange(reqHeader))
 	if err != nil {
 		return playlistFetchResult{}, s.upstreamFailure(tctx, err)
 	}
@@ -542,7 +544,7 @@ func (s *feedService) fetchPlaylist(reqHeader http.Header) (playlistFetchResult,
 	if pfErr := s.upstreamStatusFailure(tctx, s.target, resp); pfErr != nil {
 		return playlistFetchResult{}, pfErr
 	}
-	return s.readAndRewrite(tctx, resp.Body, s.target, resp.StatusCode, resp.ContentLength, s.writeStreamURI)
+	return s.readAndRewrite(tctx, resp.Body, resp.Request.URL, resp.StatusCode, resp.ContentLength, s.writeStreamURI)
 }
 
 // upstreamFailure logs a failed upstream fetch, counts it, and returns the
@@ -564,9 +566,20 @@ func (s *feedService) upstreamStatusFailure(ctx context.Context, target *url.URL
 		return nil
 	}
 	loggerFromContext(ctx, s.logger).WarnContext(ctx, "upstream returned error status",
-		"status", resp.StatusCode, "target", redact(target.String()))
+		"status", resp.StatusCode, "target", s.redactedTarget(target))
 	s.metrics.recordUpstreamError(errorKindHTTPError)
 	return &playlistFetchError{status: resp.StatusCode, msg: fmt.Sprintf("upstream returned %d", resp.StatusCode)}
+}
+
+// redactedTarget renders target for logging. redact only recognizes query
+// params, while an Xtream URL also carries the upstream's credentials as path
+// segments.
+func (s *feedService) redactedTarget(target *url.URL) string {
+	swap := credentialSwap{from: s.upstreamCreds, to: Credentials{Username: "REDACTED", Password: "REDACTED"}}
+	u := *target
+	u.Path, u.RawQuery = swap.apply(target.Path, target.RawQuery)
+	u.RawPath = ""
+	return redact(u.String())
 }
 
 // readAndRewrite turns an upstream playlist body into the result to serve. It
@@ -758,7 +771,7 @@ func (s *feedService) serveWith(reqCtx context.Context, w http.ResponseWriter, r
 	peeked, _ := buf.Peek(512)
 
 	if shouldRewritePlaylist(target, contentType, peeked) {
-		result, err := s.readAndRewrite(reqCtx, buf, target, resp.StatusCode, resp.ContentLength, writeURI)
+		result, err := s.readAndRewrite(reqCtx, buf, resp.Request.URL, resp.StatusCode, resp.ContentLength, writeURI)
 		if err != nil {
 			writeUpstreamError(w, err)
 			return
@@ -786,7 +799,7 @@ func (s *feedService) serveWith(reqCtx context.Context, w http.ResponseWriter, r
 	if live {
 		liveKey := target.String()
 		if !s.liveTargets.acquire(liveKey) {
-			logger.WarnContext(reqCtx, "rejecting duplicate live stream request", "target", redact(liveKey))
+			logger.WarnContext(reqCtx, "rejecting duplicate live stream request", "target", s.redactedTarget(target))
 			http.Error(w, "channel already being streamed", http.StatusConflict)
 			return
 		}
@@ -812,7 +825,7 @@ func (s *feedService) serveWith(reqCtx context.Context, w http.ResponseWriter, r
 	w.WriteHeader(resp.StatusCode)
 
 	if live {
-		if err := s.streamLive(reqCtx, w, target, readCloserWrapper{Reader: buf, Closer: resp.Body}); err != nil {
+		if err := s.streamLive(reqCtx, w, withoutRange(reqHeader), target, readCloserWrapper{Reader: buf, Closer: resp.Body}); err != nil {
 			// context.Canceled here means the viewer stopped playback (client
 			// closed the connection), not that the upstream or reconnect logic
 			// failed — logging it as an error would page/alert on normal
@@ -845,7 +858,7 @@ func (s *feedService) serveWith(reqCtx context.Context, w http.ResponseWriter, r
 // the client bridges that gap: the player decodes it as a very brief freeze
 // instead, and keeps reading from what still looks like a live connection
 // while the upstream reconnect happens.
-func (s *feedService) streamWithReconnect(ctx context.Context, w http.ResponseWriter, target *url.URL, initialBody io.ReadCloser) error {
+func (s *feedService) streamWithReconnect(ctx context.Context, w http.ResponseWriter, reqHeader http.Header, target *url.URL, initialBody io.ReadCloser) error {
 	logger := loggerFromContext(ctx, s.logger)
 	currentBody := initialBody
 	defer func() {
@@ -896,9 +909,15 @@ func (s *feedService) streamWithReconnect(ctx context.Context, w http.ResponseWr
 			return ctx.Err()
 		}
 
-		resp, err := s.repo.fetchWithRetry(ctx, target.String(), nil)
+		resp, err := s.repo.fetchWithRetry(ctx, target.String(), reqHeader)
 		if err != nil {
 			return err
+		}
+		// Relaying an error page would feed it to the player as video, and its
+		// bytes would reset the reconnect budget above, retrying forever.
+		if pfErr := s.upstreamStatusFailure(ctx, target, resp); pfErr != nil {
+			resp.Body.Close()
+			return pfErr
 		}
 		currentBody = resp.Body
 	}
