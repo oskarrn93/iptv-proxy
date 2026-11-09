@@ -112,18 +112,46 @@ func (t trustPolicy) stripUntrustedForwarded(r *http.Request) {
 	}
 }
 
-// adminOnly gates every /admin/* route. Login itself is Traefik's job
-// (tinyauth forward-auth on the admin router); this is the check that still
-// holds if that routing is ever wrong again: the request must have arrived
-// through a trusted proxy — so it passed whatever middleware that proxy
-// applies, rather than hitting the listen port directly — and its original
-// client must be inside admin_allowed_cidrs.
+// adminCrossOrigin rejects cross-site POST/DELETE requests. A browser attaches
+// Basic credentials and login cookies by itself, so without this any website
+// an admin visits could mint or revoke shares.
+var adminCrossOrigin = http.NewCrossOriginProtection()
+
+// adminOnly gates every /admin/* route. The original client must be inside
+// admin_allowed_cidrs, checked first so nobody outside it can probe the login.
+//
+// With admin_auth set, the request must also carry that login. Without it,
+// login is the reverse proxy's job (e.g. tinyauth forward-auth on a Traefik
+// router), and this is the check that still holds if that routing is ever
+// wrong again: the request must have arrived through a trusted proxy, so it
+// passed whatever middleware that proxy applies rather than hitting the listen
+// port directly.
 func (p *Proxy) adminOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		logger := loggerFromContext(r.Context(), p.logger)
 		client, ok := p.trust.clientAddr(r)
-		if !p.trust.peerTrusted(r) || !ok || !containsAddr(p.trust.adminAllowed, client) {
-			loggerFromContext(r.Context(), p.logger).WarnContext(r.Context(), "admin request denied",
+		if !ok || !containsAddr(p.trust.adminAllowed, client) || (p.adminAuth == nil && !p.trust.peerTrusted(r)) {
+			logger.WarnContext(r.Context(), "admin request denied",
 				"path", r.URL.Path, "remote_addr", r.RemoteAddr, "client", client.String())
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if p.adminAuth != nil {
+			user, pass, presented := r.BasicAuth()
+			userOK, passOK := p.adminAuth.matches(Credentials{Username: user, Password: pass})
+			if !presented || !userOK || !passOK {
+				// A browser's first request never carries credentials, so only
+				// a failed attempt is worth a log line.
+				if presented {
+					logger.WarnContext(r.Context(), "admin login failed", "client", client.String())
+				}
+				w.Header().Set("WWW-Authenticate", `Basic realm="iptv-proxy admin", charset="UTF-8"`)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		if err := adminCrossOrigin.Check(r); err != nil {
+			logger.WarnContext(r.Context(), "admin cross-origin request denied", "path", r.URL.Path, "client", client.String())
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}

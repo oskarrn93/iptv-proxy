@@ -1,9 +1,10 @@
 {
   "name": "admin-ui-test",
   "private": true,
-  "description": "Playwright regression tests for iptv-proxy's admin.html feed/channel comboboxes",
+  "description": "Playwright regression and screenshot tests for iptv-proxy's admin UI",
   "scripts": {
-    "test": "playwright test"
+    "test": "playwright test",
+    "screenshots": "playwright test --grep @visual --update-snapshots"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0"

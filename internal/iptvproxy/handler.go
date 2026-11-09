@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
-	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -30,6 +29,8 @@ type Proxy struct {
 	// trust decides whose X-Forwarded-* headers count and who may reach
 	// /admin/* (see trust.go).
 	trust trustPolicy
+	// adminAuth is the optional /admin/* login (see adminOnly).
+	adminAuth *Credentials
 }
 
 func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, error) {
@@ -37,9 +38,9 @@ func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, er
 	if err != nil {
 		return nil, fmt.Errorf("trust config: %w", err)
 	}
-	p := &Proxy{logger: logger, shares: newShareStore(), trust: trust}
-	if len(cfg.AdminAllowedCIDRs) == 0 || len(cfg.TrustedProxies) == 0 {
-		logger.Warn("admin UI disabled: set trusted_proxies and admin_allowed_cidrs in config.yaml to enable it")
+	p := &Proxy{logger: logger, shares: newShareStore(), trust: trust, adminAuth: cfg.AdminAuth}
+	if len(cfg.AdminAllowedCIDRs) == 0 || (len(cfg.TrustedProxies) == 0 && cfg.AdminAuth == nil) {
+		logger.Warn("admin UI disabled: set admin_allowed_cidrs and either trusted_proxies or admin_auth in config.yaml to enable it")
 	}
 
 	// Gatherers merges every feed's own registry into one /metrics response
@@ -73,20 +74,22 @@ func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, er
 
 func (p *Proxy) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
+	admin := func(pattern string, h http.HandlerFunc) {
+		mux.HandleFunc(pattern, p.withRequestLogger(p.adminOnly(h)))
+	}
 	mux.HandleFunc("/playlist.m3u8", p.withRequestLogger(p.handlePlaylist))
 	mux.HandleFunc("/", p.withRequestLogger(p.handlePlaylist))
 	mux.HandleFunc("/epg", p.withRequestLogger(p.handleEPG))
 	mux.HandleFunc("/player_api.php", p.withRequestLogger(p.handleXtreamAPI))
 	mux.HandleFunc("/panel_api.php", p.withRequestLogger(p.handleXtreamAPI))
 	mux.HandleFunc("/share/{token}", p.withRequestLogger(p.handleShare))
-	mux.HandleFunc("/admin", p.withRequestLogger(p.adminOnly(p.handleAdminPage)))
-	mux.HandleFunc("/admin/static/htmx.js", p.withRequestLogger(p.adminOnly(p.handleAdminHTMX)))
-	mux.HandleFunc("/admin/static/json-enc.js", p.withRequestLogger(p.adminOnly(p.handleAdminJSONEnc)))
-	mux.HandleFunc("/admin/feeds", p.withRequestLogger(p.adminOnly(p.handleAdminFeeds)))
-	mux.HandleFunc("/admin/channels", p.withRequestLogger(p.adminOnly(p.handleAdminChannels)))
-	mux.HandleFunc("GET /admin/shares", p.withRequestLogger(p.adminOnly(p.handleListShares)))
-	mux.HandleFunc("POST /admin/shares", p.withRequestLogger(p.adminOnly(p.handleCreateShare)))
-	mux.HandleFunc("DELETE /admin/shares/{token}", p.withRequestLogger(p.adminOnly(p.handleRevokeShare)))
+	admin("/admin", p.handleAdminPage)
+	admin("/admin/static/{file}", p.handleAdminStatic)
+	admin("/admin/feeds", p.handleAdminFeeds)
+	admin("/admin/channels", p.handleAdminChannels)
+	admin("GET /admin/shares", p.handleListShares)
+	admin("POST /admin/shares", p.handleCreateShare)
+	admin("DELETE /admin/shares/{token}", p.handleRevokeShare)
 	mux.HandleFunc("/{prefix}/{username}/{password}/{rest...}", p.withRequestLogger(p.handleStream))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, max-age=0")
@@ -103,6 +106,12 @@ func (p *Proxy) Mux() *http.ServeMux {
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+}
+
+// WriteString forwards to the wrapped writer so a string body isn't copied to
+// []byte first; a cached playlist can be tens of MB and apps poll it often.
+func (r *statusRecorder) WriteString(s string) (int, error) {
+	return io.WriteString(r.ResponseWriter, s)
 }
 
 func (r *statusRecorder) WriteHeader(status int) {
@@ -194,8 +203,7 @@ func (p *Proxy) rejectUnauthorized(w http.ResponseWriter, r *http.Request, candi
 // either ?username=&password= query params or HTTP Basic Auth so both "M3U
 // URL" and "Xtream login" style IPTV apps work.
 func requestCredentials(r *http.Request) Credentials {
-	query := r.URL.Query()
-	creds := Credentials{Username: query.Get("username"), Password: query.Get("password")}
+	creds := credentialsFromURL(r.URL)
 	if creds.Username == "" && creds.Password == "" {
 		if user, pass, ok := r.BasicAuth(); ok {
 			creds = Credentials{Username: user, Password: pass}
@@ -407,13 +415,11 @@ func (p *Proxy) handleCreateShare(w http.ResponseWriter, r *http.Request) {
 	// directly in (hx-target="#result" hx-swap="innerHTML" on the form), the
 	// same server-rendered-fragment pattern every other /admin/* route uses.
 	shareURL := requestBaseURL(r) + "/share/" + token
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<p>Share created for <strong>%s</strong>, expires <strong>%s</strong>:</p><p><a href="%s" target="_blank" rel="noopener">%s</a></p>`,
-		html.EscapeString(cmp.Or(req.ChannelName, "this channel")),
-		html.EscapeString(expiresAt.Format("2006-01-02 15:04:05 MST")),
-		html.EscapeString(shareURL),
-		html.EscapeString(shareURL),
-	)
+	renderAdminFragment(w, "share-created", struct{ Channel, Expires, URL string }{
+		Channel: cmp.Or(req.ChannelName, "this channel"),
+		Expires: expiresAt.Format("2006-01-02 15:04:05 MST"),
+		URL:     shareURL,
+	})
 }
 
 // handleRevokeShare drops one share immediately instead of waiting out its
@@ -428,5 +434,7 @@ func (p *Proxy) handleRevokeShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logger.InfoContext(r.Context(), "share revoked")
-	w.WriteHeader(http.StatusNoContent)
+	// 200 with an empty body, not 204: htmx doesn't swap on a 204, which would
+	// leave the revoked row on the admin page.
+	w.WriteHeader(http.StatusOK)
 }

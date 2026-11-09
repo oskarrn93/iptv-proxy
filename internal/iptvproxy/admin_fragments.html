@@ -1,0 +1,13 @@
+{{define "options"}}{{range .}}<option value="{{.Value}}">{{.Label}}</option>{{end}}{{end}}
+
+{{define "shares"}}{{range .}}<tr id="share-{{.Token}}">
+  <td>{{.Channel}}</td>
+  <td>{{.Feed}}</td>
+  <td>{{.Kind}}</td>
+  <td>{{.Expires}}</td>
+  <td><a href="{{.URL}}" target="_blank" rel="noopener">watch</a></td>
+  <td><button class="small" hx-delete="/admin/shares/{{.Token}}" hx-target="#share-{{.Token}}" hx-swap="outerHTML">revoke</button></td>
+</tr>{{else}}<tr><td colspan="6"><em>no active shares</em></td></tr>{{end}}{{end}}
+
+{{define "share-created"}}<p>Share created for <strong>{{.Channel}}</strong>, expires <strong>{{.Expires}}</strong>:</p>
+<p><a href="{{.URL}}" target="_blank" rel="noopener">{{.URL}}</a></p>{{end}}

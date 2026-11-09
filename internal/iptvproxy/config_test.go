@@ -191,3 +191,35 @@ feeds:
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "duplicate username")
 }
+
+func TestLoadConfig_AdminAuth(t *testing.T) {
+	const feeds = `
+listen_addr: ":0"
+feeds:
+  - name: f
+    upstream_url: "http://upstream.example.com/get.php"
+    username: u
+    password: p
+`
+	load := func(t *testing.T, extra string) (*Config, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(feeds+extra), 0o600))
+		return LoadConfig(path)
+	}
+
+	t.Run("omitted", func(t *testing.T) {
+		cfg, err := load(t, "")
+		require.NoError(t, err)
+		assert.Nil(t, cfg.AdminAuth)
+	})
+	t.Run("set", func(t *testing.T) {
+		cfg, err := load(t, "admin_auth:\n  username: admin\n  password: hunter2\n")
+		require.NoError(t, err)
+		assert.Equal(t, &Credentials{Username: "admin", Password: "hunter2"}, cfg.AdminAuth)
+	})
+	t.Run("missing password is rejected", func(t *testing.T) {
+		_, err := load(t, "admin_auth:\n  username: admin\n")
+		assert.ErrorContains(t, err, "password is required")
+	})
+}

@@ -1,5 +1,5 @@
 // Regression tests for the admin page's feed/channel comboboxes
-// (admin.html's <script> at the bottom, backed by admin.go's
+// (static/admin.js, backed by admin.go's
 // handleAdminFeeds/handleAdminChannels). These exist because the wiring
 // between htmx's hx-get/hx-trigger attributes and the hand-rolled
 // setupCombobox() JS is easy to silently break — e.g. pre-selecting a
@@ -18,6 +18,10 @@
 
 const { test, expect } = require("@playwright/test");
 const { startServer } = require("./server");
+
+// Must match handleRevokeShare's status: htmx doesn't swap on a 204, so that
+// would leave a revoked row on the page.
+const REVOKE_STATUS = 200;
 
 const FEEDS_HTML =
   '<option value="feed-1">feed-1</option><option value="feed-2">feed-2</option>';
@@ -201,6 +205,140 @@ test("a feed with no channels shows the channel combo's empty state, not a stale
     await expect(page.locator("#channel")).toHaveValue("");
     await expect(page.locator("#channel-list")).toContainText("no channels");
     expect(pageErrors).toEqual([]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("the page's stylesheet is loaded", async ({ page }) => {
+  const { server } = await openAdminPage(page, standardRoutes());
+  try {
+    await expect(page.locator(".combo").first()).toHaveCSS("position", "relative");
+  } finally {
+    await server.close();
+  }
+});
+
+async function waitForChannels(page) {
+  await expect(page.locator("#channel-search")).toHaveAttribute("placeholder", "Search channel...");
+}
+
+test("arrow keys and Enter pick a channel", async ({ page }) => {
+  const { server } = await openAdminPage(page, standardRoutes());
+  try {
+    await waitForChannels(page);
+    await page.locator("#channel-search").focus();
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Enter");
+
+    await expect(page.locator("#channel-search")).toHaveValue("Channel Two");
+    await expect(page.locator("#channel")).toHaveValue("http://x/feed-1/2.ts");
+    await expect(page.locator("#channel-list")).toBeHidden();
+  } finally {
+    await server.close();
+  }
+});
+
+test("typing filters channels and says when nothing matches", async ({ page }) => {
+  const { server } = await openAdminPage(page, standardRoutes());
+  try {
+    await waitForChannels(page);
+    await page.locator("#channel-search").fill("two");
+    await expect(page.locator("#channel-list .combo-option")).toHaveText(["Channel Two"]);
+
+    await page.locator("#channel-search").fill("zzz");
+    await expect(page.locator("#channel-list .combo-option")).toHaveText(["no matches"]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("Escape closes the dropdown", async ({ page }) => {
+  const { server } = await openAdminPage(page, standardRoutes());
+  try {
+    await waitForChannels(page);
+    await page.locator("#channel-search").focus();
+    await expect(page.locator("#channel-list")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#channel-list")).toBeHidden();
+  } finally {
+    await server.close();
+  }
+});
+
+// Mirrors the "shares" template in admin_fragments.html.
+function shareRow(token) {
+  return (
+    `<tr id="share-${token}"><td>Channel One</td><td>feed-1</td><td>live</td><td>12:00:00 UTC</td>` +
+    `<td><a href="http://x/share/${token}">watch</a></td>` +
+    `<td><button class="small" hx-delete="/admin/shares/${token}" hx-target="#share-${token}" hx-swap="outerHTML">revoke</button></td></tr>`
+  );
+}
+
+test("creating a share posts JSON, shows the link and refreshes the table", async ({ page }) => {
+  let posted = false;
+  const routes = {
+    ...standardRoutes(),
+    "/admin/shares": (_url, req) => {
+      if (req.method === "POST") {
+        posted = true;
+        return { body: '<p id="created">Share created</p>' };
+      }
+      return { body: posted ? shareRow("abc") : "" };
+    },
+  };
+  const { server } = await openAdminPage(page, routes);
+  try {
+    await waitForChannels(page);
+    await page.locator("#channel-search").focus();
+    await page.keyboard.press("Enter");
+    await page.locator("#ttl").fill("90m");
+
+    const [request] = await Promise.all([
+      page.waitForRequest((r) => r.method() === "POST"),
+      page.getByRole("button", { name: "Create share link" }).click(),
+    ]);
+
+    expect(request.headers()["content-type"]).toContain("application/json");
+    expect(request.postDataJSON()).toEqual({
+      feed: "feed-1",
+      channel_name: "Channel One",
+      channel_url: "http://x/feed-1/1.ts",
+      ttl: "90m",
+    });
+    await expect(page.locator("#created")).toBeVisible();
+    await expect(page.locator("#share-abc")).toBeVisible();
+  } finally {
+    await server.close();
+  }
+});
+
+test("a rejected share shows the server's error", async ({ page }) => {
+  const routes = {
+    ...standardRoutes(),
+    "/admin/shares": (_url, req) =>
+      req.method === "POST" ? { status: 400, body: "invalid ttl" } : { body: "" },
+  };
+  const { server } = await openAdminPage(page, routes);
+  try {
+    await waitForChannels(page);
+    await page.getByRole("button", { name: "Create share link" }).click();
+    await expect(page.locator("#result")).toHaveText("invalid ttl");
+  } finally {
+    await server.close();
+  }
+});
+
+test("revoking a share removes its row", async ({ page }) => {
+  const routes = {
+    ...standardRoutes(),
+    "/admin/shares": () => ({ body: shareRow("abc") }),
+    "/admin/shares/abc": () => ({ status: REVOKE_STATUS, body: "" }),
+  };
+  const { server } = await openAdminPage(page, routes);
+  try {
+    await page.getByRole("button", { name: "revoke" }).click();
+    await expect(page.locator("#share-abc")).toHaveCount(0);
   } finally {
     await server.close();
   }
