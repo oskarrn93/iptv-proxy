@@ -1,6 +1,7 @@
 package iptvproxy
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"math"
@@ -86,8 +87,7 @@ func (dr *delayedReader) pump(src io.Reader) {
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
+			chunk := bytes.Clone(buf[:n])
 			select {
 			case dr.chunks <- delayChunk{data: chunk, at: time.Now()}:
 			case <-dr.ctx.Done():
@@ -125,10 +125,7 @@ func (dr *delayedReader) Read(p []byte) (int, error) {
 		// dr.delay of wall-clock time since streaming started, rather than
 		// applying the full delay from the very first chunk — see the
 		// delayedReader doc comment.
-		effectiveDelay := dr.delay
-		if elapsed := chunk.at.Sub(dr.start); elapsed < dr.delay {
-			effectiveDelay = elapsed
-		}
+		effectiveDelay := min(dr.delay, chunk.at.Sub(dr.start))
 		if wait := time.Until(chunk.at.Add(effectiveDelay)); wait > 0 {
 			timer := time.NewTimer(wait)
 			select {
@@ -173,9 +170,9 @@ func (p pipeResponseWriter) WriteHeader(int)             {}
 // own reconnect/gap-bridging logic is unchanged) and a delayedReader between
 // that pipe and the real client absorbs upstream hiccups shorter than the
 // configured duration before they ever reach the client.
-func (s *feedService) streamLive(ctx context.Context, w http.ResponseWriter, target *url.URL, initialBody io.ReadCloser) error {
+func (s *feedService) streamLive(ctx context.Context, w http.ResponseWriter, reqHeader http.Header, target *url.URL, initialBody io.ReadCloser) error {
 	if s.clientBufferDelay == nil {
-		return s.streamWithReconnect(ctx, w, target, initialBody)
+		return s.streamWithReconnect(ctx, w, reqHeader, target, initialBody)
 	}
 
 	// producerCtx is canceled as soon as this function stops reading from the
@@ -188,7 +185,7 @@ func (s *feedService) streamLive(ctx context.Context, w http.ResponseWriter, tar
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
 	go func() {
-		err := s.streamWithReconnect(producerCtx, pipeResponseWriter{pw}, target, initialBody)
+		err := s.streamWithReconnect(producerCtx, pipeResponseWriter{pw}, reqHeader, target, initialBody)
 		pw.CloseWithError(err)
 		errCh <- err
 	}()

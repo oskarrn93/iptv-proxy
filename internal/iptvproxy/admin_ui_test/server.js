@@ -4,10 +4,9 @@
 // Playwright can drive the REAL admin.html (../admin.html — the file
 // admin.go go:embeds and serves byte-for-byte) over real HTTP in a real
 // browser, without needing a running iptv-proxy instance or real IPTV
-// feeds. /admin/static/htmx.js and /admin/static/json-enc.js are served
-// from ../static/ — the exact files admin.go embeds and admin.html's
-// <script src> tags point at — so there's no separate vendored copy for
-// these tests to fall out of sync with. Each test supplies its own
+// feeds. /admin/static/* is served from ../static/ — the exact files admin.go
+// embeds — so there's no separate copy for these tests to fall out of sync
+// with. Each test supplies its own
 // `routes` (see admin.test.js) to control what /admin/feeds,
 // /admin/channels, and /admin/shares return.
 "use strict";
@@ -18,13 +17,11 @@ const path = require("node:path");
 
 const ADMIN_HTML_PATH = path.join(__dirname, "..", "admin.html");
 const STATIC_DIR = path.join(__dirname, "..", "static");
-const STATIC_FILES = {
-  "/admin/static/htmx.js": path.join(STATIC_DIR, "htmx.js"),
-  "/admin/static/json-enc.js": path.join(STATIC_DIR, "json-enc.js"),
-};
+const STATIC_PREFIX = "/admin/static/";
+const STATIC_TYPES = { ".js": "application/javascript", ".css": "text/css" };
 
 /**
- * @param {Object<string, (url: URL) => {status?: number, body: string}>} routes
+ * @param {Object<string, (url: URL, req: http.IncomingMessage) => {status?: number, body?: string}>} routes
  * @returns {Promise<{url: string, close: () => Promise<void>}>}
  */
 function startServer(routes) {
@@ -35,9 +32,10 @@ function startServer(routes) {
       res.end(fs.readFileSync(ADMIN_HTML_PATH, "utf8"));
       return;
     }
-    if (STATIC_FILES[url.pathname]) {
-      res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
-      res.end(fs.readFileSync(STATIC_FILES[url.pathname], "utf8"));
+    if (url.pathname.startsWith(STATIC_PREFIX)) {
+      const file = path.basename(url.pathname);
+      res.writeHead(200, { "Content-Type": `${STATIC_TYPES[path.extname(file)]}; charset=utf-8` });
+      res.end(fs.readFileSync(path.join(STATIC_DIR, file), "utf8"));
       return;
     }
     const handler = routes[url.pathname];
@@ -46,7 +44,7 @@ function startServer(routes) {
       res.end(`no route stubbed for ${url.pathname}`);
       return;
     }
-    const { status = 200, body } = handler(url);
+    const { status = 200, body } = handler(url, req);
     res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
     res.end(body);
   });

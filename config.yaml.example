@@ -28,12 +28,16 @@ client_buffer:
 # The /admin page and API (POST /admin/shares mints a temporary, unguessable
 # link — GET /share/<token> — to a single channel of a single feed, for
 # sending one stream to someone without handing out real feed credentials).
-# Login is handled by docker-compose.yml's iptv-proxy-go-admin router
-# (lan-only + tinyauth forward-auth / Pocket ID OIDC). On top of that the app
-# only serves /admin/* to requests that arrived through one of
-# trusted_proxies from a client inside admin_allowed_cidrs — so hitting the
-# listen port directly, or reaching /admin through any router without that
-# login, gets a 403. Leave either list empty to disable /admin entirely.
+# It is disabled unless admin_allowed_cidrs is set. Pick one way to protect it:
+#
+# - Behind an authenticating reverse proxy: set trusted_proxies too. /admin/*
+#   is then only served to requests that arrived through one of
+#   trusted_proxies from a client inside admin_allowed_cidrs, so hitting the
+#   listen port directly gets a 403.
+# - Without a reverse proxy: set admin_auth, which requires that HTTP Basic
+#   login on every /admin/* request, still only from admin_allowed_cidrs. Over
+#   plain HTTP the password and share links are unencrypted, so keep this to a
+#   network you trust.
 #
 # trusted_proxies is also the only source of X-Forwarded-* headers this proxy
 # believes; they're stripped from every other request.
@@ -41,11 +45,15 @@ client_buffer:
 #   curl -X POST https://iptv.example.com/admin/shares \
 #     -H "Content-Type: application/json" \
 #     -d '{"feed":"feed-1","channel_url":"http://<host>:<listen_port>/live/proxyuser1/proxypass1/12345.ts","ttl":"4h"}'
-trusted_proxies:
-  - "172.30.0.0/16" # traefik_internal (docker network inspect traefik_internal)
-admin_allowed_cidrs:
-  - "192.168.1.0/24" # LAN
-  - "172.16.0.0/12" # Docker bridges — LAN clients on the server itself
+#
+# trusted_proxies:
+#   - "172.30.0.0/16" # traefik_internal (docker network inspect traefik_internal)
+# admin_allowed_cidrs:
+#   - "192.168.1.0/24" # LAN
+#   - "172.16.0.0/12" # Docker bridges — LAN clients on the server itself
+# admin_auth:
+#   username: admin
+#   password: change-me
 
 # The host rewritten /stream links point back to is auto-detected from each
 # request (Host, or X-Forwarded-Host/-Proto from a trusted_proxies peer such
