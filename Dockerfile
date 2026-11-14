@@ -1,6 +1,6 @@
 # Pinned to the builder's platform so multi-arch images cross-compile with Go
 # instead of running the whole toolchain under QEMU.
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine3.24 AS build
 ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
