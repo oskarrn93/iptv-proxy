@@ -79,7 +79,7 @@ func requestBaseURL(r *http.Request) string {
 }
 
 // requestHost derives the host a client actually reached this proxy at,
-// e.g. "iptv.oskarrosen.io" or "192.168.1.12:8080" — the same
+// e.g. "iptv.example.com" or "192.168.1.50:8080" — the same
 // X-Forwarded-Host-over-Host precedence as requestBaseURL, but without the
 // scheme, for attaching to logs/metrics as "which entry point was this
 // request made through" (LAN vs. external).

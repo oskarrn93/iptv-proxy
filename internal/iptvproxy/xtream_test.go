@@ -77,13 +77,13 @@ func TestHandleXtreamAPI_RewritesDirectSourceURL(t *testing.T) {
 	p := newTestProxy(t, upstream.URL+"/get.php?username=xtreamuser&password=xtreampass")
 
 	req := httptest.NewRequest(http.MethodGet, "/player_api.php?username=alice&password=secret&action=get_vod_streams", nil)
-	req.Host = "iptv.oskarrosen.io"
+	req.Host = "iptv.example.com"
 	rec := httptest.NewRecorder()
 	p.handleXtreamAPI(rec, req)
 
 	require.Equal(t, http.StatusOK, rec.Code)
 	body := rec.Body.String()
-	assert.Contains(t, body, "http://iptv.oskarrosen.io/movie/alice/secret/1.mkv")
+	assert.Contains(t, body, "http://iptv.example.com/movie/alice/secret/1.mkv")
 	assert.NotContains(t, body, "xtreamuser")
 	assert.NotContains(t, body, "xtreampass")
 	assert.NotContains(t, body, upstream.URL)

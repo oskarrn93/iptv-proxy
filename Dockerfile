@@ -15,7 +15,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o
 FROM alpine:3.24
 RUN apk add --no-cache ca-certificates
 COPY --from=build /iptv-proxy /iptv-proxy
-# Unprivileged by default. docker-compose.yml overrides this with the host
-# user that owns config.yaml (mode 600), so the mounted file stays readable.
+# Unprivileged by default. If config.yaml is mounted with mode 600, override
+# this with the host user that owns it (e.g. compose `user:`) so it stays readable.
 USER 65532:65532
 ENTRYPOINT ["/iptv-proxy", "-config", "/config/config.yaml"]

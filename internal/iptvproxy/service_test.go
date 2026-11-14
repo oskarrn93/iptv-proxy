@@ -192,7 +192,7 @@ func TestRewritePlaylist_BaseURLPerRequest(t *testing.T) {
 	assert.Contains(t, out, baseURLPlaceholder+"/stream/")
 	assert.NotContains(t, out, "upstream.example.com") // raw upstream host never appears
 
-	for _, host := range []string{"http://192.168.1.12:58033", "https://public.example.com"} {
+	for _, host := range []string{"http://192.168.1.50:58033", "https://public.example.com"} {
 		resolved := applyBaseURL(out, host)
 		assert.Contains(t, resolved, host+"/stream/")
 		assert.NotContains(t, resolved, baseURLPlaceholder)

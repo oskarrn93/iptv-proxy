@@ -47,7 +47,7 @@ client_buffer:
 #     -d '{"feed":"feed-1","channel_url":"http://<host>:<listen_port>/live/proxyuser1/proxypass1/12345.ts","ttl":"4h"}'
 #
 # trusted_proxies:
-#   - "172.30.0.0/16" # traefik_internal (docker network inspect traefik_internal)
+#   - "172.30.0.0/16" # the reverse proxy's Docker network
 # admin_allowed_cidrs:
 #   - "192.168.1.0/24" # LAN
 #   - "172.16.0.0/12" # Docker bridges — LAN clients on the server itself

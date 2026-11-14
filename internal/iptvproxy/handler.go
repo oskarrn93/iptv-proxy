@@ -363,9 +363,8 @@ type createShareRequest struct {
 // given the exact channel URL a client already uses against that feed (a
 // share itself carries no credentials of its own). Every /admin/* route,
 // this one included, is wrapped in adminOnly (trusted proxy + allowed client
-// CIDR) and relies on Traefik's admin router for login — LAN-only, gated by
-// the tinyauth forward-auth middleware (OIDC login via Pocket ID) — see
-// docker-compose.yml.
+// CIDR) and relies on admin_auth or the reverse proxy in front of it for
+// login.
 // It resolves req.ChannelURL back to the real upstream URL through the same
 // feed.streamTarget path a normal /stream request would, so a share can never
 // point anywhere a client couldn't already reach with valid feed credentials.

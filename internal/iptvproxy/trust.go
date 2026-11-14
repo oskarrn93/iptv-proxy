@@ -121,7 +121,7 @@ var adminCrossOrigin = http.NewCrossOriginProtection()
 // admin_allowed_cidrs, checked first so nobody outside it can probe the login.
 //
 // With admin_auth set, the request must also carry that login. Without it,
-// login is the reverse proxy's job (e.g. tinyauth forward-auth on a Traefik
+// login is the reverse proxy's job (e.g. forward-auth middleware on its
 // router), and this is the check that still holds if that routing is ever
 // wrong again: the request must have arrived through a trusted proxy, so it
 // passed whatever middleware that proxy applies rather than hitting the listen

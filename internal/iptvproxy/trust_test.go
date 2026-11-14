@@ -70,21 +70,21 @@ func TestStripUntrustedForwarded(t *testing.T) {
 	p := newTrustedTestProxy(t)
 
 	t.Run("untrusted peer loses forwarded headers", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.12:58033/playlist.m3u8", nil)
+		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.50:58033/playlist.m3u8", nil)
 		req.RemoteAddr = "192.168.1.50:40000"
 		req.Header.Set("X-Forwarded-Host", "evil.example.com")
 		req.Header.Set("X-Forwarded-Proto", "https")
 		p.trust.stripUntrustedForwarded(req)
-		assert.Equal(t, "http://192.168.1.12:58033", requestBaseURL(req))
+		assert.Equal(t, "http://192.168.1.50:58033", requestBaseURL(req))
 	})
 
 	t.Run("trusted proxy keeps them", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "http://vpn:58033/playlist.m3u8", nil)
+		req := httptest.NewRequest(http.MethodGet, "http://iptv-proxy:58033/playlist.m3u8", nil)
 		req.RemoteAddr = "172.30.0.9:40000"
-		req.Header.Set("X-Forwarded-Host", "iptv.oskarrosen.io")
+		req.Header.Set("X-Forwarded-Host", "iptv.example.com")
 		req.Header.Set("X-Forwarded-Proto", "https")
 		p.trust.stripUntrustedForwarded(req)
-		assert.Equal(t, "https://iptv.oskarrosen.io", requestBaseURL(req))
+		assert.Equal(t, "https://iptv.example.com", requestBaseURL(req))
 	})
 }
 

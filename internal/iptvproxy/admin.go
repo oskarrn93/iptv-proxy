@@ -14,7 +14,7 @@ import (
 // one of its channels, choose a TTL, and mint a share link — via the same
 // POST /admin/shares endpoint any other admin client uses. Every /admin/*
 // route, including this page, has no auth check of its own — see
-// handleCreateShare for why (Traefik/tinyauth gates the whole path instead).
+// handleCreateShare for why (adminOnly gates the whole path instead).
 //
 //go:embed admin.html
 var adminPageHTML []byte

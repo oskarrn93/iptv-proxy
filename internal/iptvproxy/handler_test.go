@@ -251,11 +251,11 @@ func TestHandlePlaylist_BaseURLPerRequestHost(t *testing.T) {
 	p := newTestProxy(t, upstream.URL+"/get.php")
 
 	lanReq := httptest.NewRequest(http.MethodGet, "/playlist.m3u8?username=alice&password=secret", nil)
-	lanReq.Host = "192.168.1.12:58033"
+	lanReq.Host = "192.168.1.50:58033"
 	lanRec := httptest.NewRecorder()
 	p.handlePlaylist(lanRec, lanReq)
 	require.Equal(t, http.StatusOK, lanRec.Code)
-	assert.Contains(t, lanRec.Body.String(), "http://192.168.1.12:58033/stream/")
+	assert.Contains(t, lanRec.Body.String(), "http://192.168.1.50:58033/stream/")
 
 	extReq := httptest.NewRequest(http.MethodGet, "/playlist.m3u8?username=alice&password=secret", nil)
 	extReq.Host = "internal-host:58033"
