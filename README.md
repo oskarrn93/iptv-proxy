@@ -100,6 +100,8 @@ A view is a separate login that sees only the channels of one feed that its rule
 views_file: /data/views.json
 ```
 
+![Views page with the view list and the editor](docs/screenshots/admin-views.png)
+
 - **Rules:** regexes on channel name, group or `tvg-id` to include or exclude, plus channels you pin (always shown) or block (never shown). Blocked beats pinned beats exclude beats include.
 - **Re-matching:** rules are stored, not their results. When the upstream playlist changes, the view follows. The editor's preview flags pins and blocks that no longer match any channel.
 - **Where it applies:** the M3U playlist, `player_api.php` live streams and categories, and stream playback (a view can't play a channel it doesn't list). VOD, series and the EPG are not filtered.

@@ -74,3 +74,45 @@ test("channel search dropdown @visual", async ({ page }) => {
     await server.close();
   }
 });
+
+const viewRow = (name, feed, user, summary) =>
+  `<tr id="view-${name}"><td>${name}</td><td>${feed}</td><td>${user}</td><td>${summary}</td>` +
+  `<td><button class="small">edit</button> <button class="small">delete</button></td></tr>`;
+
+const editor = `<form id="view-form">
+  <h2>Edit kids</h2>
+  <input type="hidden" name="original" value="kids" />
+  <label for="view-name">Name</label>
+  <input id="view-name" name="name" value="kids" readonly />
+  <label for="view-feed">Feed</label>
+  <select id="view-feed" name="feed"><option value="home" selected>home</option></select>
+  <label for="view-username">Username</label>
+  <input id="view-username" name="username" value="kidsviewer" />
+  <label for="view-password">Password</label>
+  <input id="view-password" name="password" value="4f9c2a7e1b" />
+  <label for="view-include">Include</label>
+  <textarea id="view-include" name="include" rows="4">group: ^Kids</textarea>
+  <label for="view-exclude">Exclude</label>
+  <textarea id="view-exclude" name="exclude" rows="3">name: (?i)adult</textarea>
+  <button type="submit">Save view</button>
+</form>`;
+
+test("views admin page @visual", async ({ page }) => {
+  const server = await startServer({
+    "/admin/views/list": () => ({
+      body:
+        viewRow("kids", "home", "kidsviewer", "1 include, 1 exclude") +
+        viewRow("sports", "travel", "sp0rt5", "2 includes, 3 pinned"),
+    }),
+    "/admin/views/editor": () => ({ body: editor }),
+  });
+  try {
+    await page.goto(new URL("views", server.url).href);
+    await expect(page.locator("#view-kids")).toBeVisible();
+    await page.getByRole("button", { name: "New view" }).click();
+    await expect(page.locator("#view-form")).toBeVisible();
+    await expect(page).toHaveScreenshot("admin-views.png", { fullPage: true });
+  } finally {
+    await server.close();
+  }
+});
