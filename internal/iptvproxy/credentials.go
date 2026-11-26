@@ -15,8 +15,8 @@ import (
 // It is embedded inline into FeedConfig, so config.yaml still spells the pair
 // as plain `username:`/`password:` keys on a feed.
 type Credentials struct {
-	Username string `yaml:"username" validate:"required"`
-	Password string `yaml:"password" validate:"required"`
+	Username string `yaml:"username" json:"username" validate:"required"`
+	Password string `yaml:"password" json:"password" validate:"required"`
 }
 
 // credentialsFromURL reads the credentials an Xtream upstream URL carries as

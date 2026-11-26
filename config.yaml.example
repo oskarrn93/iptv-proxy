@@ -55,6 +55,11 @@ client_buffer:
 #   username: admin
 #   password: change-me
 
+# Curated views: extra credential pairs that see only part of a feed. Views are
+# stored in this JSON file (created owner-only; its directory must exist) and
+# edited at runtime, not in this YAML. Leave unset to disable views.
+# views_file: /data/views.json
+
 # The host rewritten /stream links point back to is auto-detected from each
 # request (Host, or X-Forwarded-Host/-Proto from a trusted_proxies peer such
 # as Traefik) — no public_base_url needs configuring. That also means the same
