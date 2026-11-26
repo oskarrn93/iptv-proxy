@@ -96,11 +96,11 @@ Over plain HTTP, the password and share links are unencrypted, so only use `admi
 
 A view is a separate login that sees only the channels of one feed that its rules allow, for example one household member's picks. Set `views_file` and manage views at `/admin/views`:
 
-![Views page with the view list and the editor](docs/screenshots/admin-views.png)
-
 ```yaml
 views_file: /data/views.json
 ```
+
+![Views page with the view list and the editor](docs/screenshots/admin-views.png)
 
 - **Rules:** regexes on channel name, group or `tvg-id` to include or exclude, plus channels you pin (always shown) or block (never shown). Blocked beats pinned beats exclude beats include.
 - **Re-matching:** rules are stored, not their results. When the upstream playlist changes, the view follows. The editor's preview flags pins and blocks that no longer match any channel.

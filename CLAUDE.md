@@ -32,7 +32,7 @@ go test ./...
 go vet ./...
 ```
 
-The admin UI is `internal/iptvproxy/admin.html` (page markup), `static/admin.css` and `static/admin.js` (its style and behavior), and `admin_fragments.html` (the templates `/admin/*` returns for htmx to swap). It has its own Playwright suite (real Chromium, no live server needed — see `internal/iptvproxy/admin_ui_test/README.md`). `npm run screenshots` regenerates the README images in `docs/screenshots`:
+The admin UI is `internal/iptvproxy/admin.html` (page markup), `static/admin.css` and `static/admin.js` (its style and behavior), and `admin_fragments.html` (the templates `/admin/*` returns for htmx to swap). It has its own Playwright suite (real Chromium, no live server needed — see `internal/iptvproxy/admin_ui_test/README.md`). `make screenshots` (macOS only) regenerates the README images in `docs/screenshots`. The suite itself runs with:
 
 ```sh
 cd internal/iptvproxy/admin_ui_test && npm ci && npx playwright install chromium && npm test
