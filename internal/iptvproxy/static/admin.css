@@ -114,3 +114,16 @@ button[type="submit"] {
   align-items: center;
   gap: 0.5rem;
 }
+textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-family: ui-monospace, monospace;
+  padding: 0.4rem;
+}
+.error {
+  color: #b00020;
+}
+body:has(#views) {
+  max-width: 60rem;
+}

@@ -11,3 +11,75 @@
 
 {{define "share-created"}}<p>Share created for <strong>{{.Channel}}</strong>, expires <strong>{{.Expires}}</strong>:</p>
 <p><a href="{{.URL}}" target="_blank" rel="noopener">{{.URL}}</a></p>{{end}}
+
+{{define "view-list"}}{{range .}}<tr id="view-{{.Name}}">
+  <td>{{.Name}}</td>
+  <td>{{.Feed}}</td>
+  <td>{{.Username}}</td>
+  <td>{{.Summary}}</td>
+  <td>
+    <button class="small" hx-get="/admin/views/editor?name={{.Name}}" hx-target="#editor" hx-swap="innerHTML">edit</button>
+    <button class="small" hx-delete="/admin/views/{{.Name}}" hx-confirm="Delete view {{.Name}}?" hx-target="#status" hx-swap="innerHTML">delete</button>
+  </td>
+</tr>{{else}}<tr><td colspan="5"><em>no views</em></td></tr>{{end}}{{end}}
+
+{{define "view-editor"}}<form id="view-form" hx-post="/admin/views" hx-target="#status" hx-swap="innerHTML">
+  <h2>{{if .Original}}Edit {{.Original}}{{else}}New view{{end}}</h2>
+  <input type="hidden" name="original" value="{{.Original}}" />
+
+  <label for="view-name">Name</label>
+  <input id="view-name" name="name" value="{{.Name}}" {{if .Original}}readonly{{end}} required />
+
+  <label for="view-feed">Feed</label>
+  <select id="view-feed" name="feed">
+    {{range .Feeds}}<option value="{{.}}"{{if eq . $.Feed}} selected{{end}}>{{.}}</option>{{end}}
+  </select>
+
+  <label for="view-username">Username <small>(blank = generate)</small></label>
+  <input id="view-username" name="username" value="{{.Username}}" autocomplete="off" />
+  <label for="view-password">Password <small>(blank = generate)</small></label>
+  <input id="view-password" name="password" value="{{.Password}}" autocomplete="off" />
+  {{if .PlaylistURL}}<p>Playlist: <code>{{.PlaylistURL}}</code></p>{{end}}
+
+  <label for="view-include">Include <small>(one regex per line, as <code>name:</code>, <code>group:</code> or <code>tvg_id:</code> + regex; empty = everything)</small></label>
+  <textarea id="view-include" name="include" rows="4">{{.Include}}</textarea>
+  <label for="view-exclude">Exclude</label>
+  <textarea id="view-exclude" name="exclude" rows="3">{{.Exclude}}</textarea>
+
+  <div id="lists">{{template "view-lists" .}}</div>
+
+  <button type="submit">Save view</button>
+
+  <h3>Preview</h3>
+  <label for="view-q">Find channel</label>
+  <input id="view-q" name="q" placeholder="filter the list below by name" />
+  <div
+    id="preview"
+    hx-post="/admin/views/preview"
+    hx-include="#view-form"
+    hx-trigger="load, input from:#view-form delay:400ms, rules-changed from:body"
+    hx-swap="innerHTML"
+  ></div>
+</form>{{end}}
+
+{{define "view-lists"}}<label for="view-pinned">Pinned <small>(always shown)</small></label>
+<textarea id="view-pinned" name="pinned" rows="3">{{.Pinned}}</textarea>
+<label for="view-blocked">Blocked <small>(never shown)</small></label>
+<textarea id="view-blocked" name="blocked" rows="3">{{.Blocked}}</textarea>{{end}}
+
+{{define "view-preview"}}{{if .Error}}<p class="error">{{.Error}}</p>{{else}}
+<p><strong>{{.Allowed}}</strong> of {{.Total}} channels shown to this view.</p>
+{{if .Orphans}}<p>Rules matching no channel in the current playlist: {{range .Orphans}}<code>{{.}}</code> {{end}}</p>{{end}}
+<table>
+  <thead><tr><th></th><th>channel</th><th>group</th><th></th></tr></thead>
+  <tbody>{{range .Rows}}<tr>
+    <td>{{if .Allowed}}&#10003;{{else}}&#10005;{{end}}</td>
+    <td title="{{.Key}}">{{.Name}}</td>
+    <td>{{.Group}}</td>
+    <td>
+      <button type="button" class="small" hx-post="/admin/views/toggle" hx-include="#view-form" hx-vals="{{.PinVals}}" hx-target="#lists" hx-swap="innerHTML">{{if .Pinned}}unpin{{else}}pin{{end}}</button>
+      <button type="button" class="small" hx-post="/admin/views/toggle" hx-include="#view-form" hx-vals="{{.BlockVals}}" hx-target="#lists" hx-swap="innerHTML">{{if .Blocked}}unblock{{else}}block{{end}}</button>
+    </td>
+  </tr>{{end}}</tbody>
+</table>
+{{if .Truncated}}<p><em>Showing the first {{len .Rows}}; narrow it with “Find channel”.</em></p>{{end}}{{end}}{{end}}

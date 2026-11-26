@@ -66,6 +66,7 @@ func TestViewStore_Validation(t *testing.T) {
 	bad := func(mut func(*View)) View { v := testView("other", "carol"); mut(&v); return v }
 	tests := map[string]View{
 		"no name":              bad(func(v *View) { v.Name = "" }),
+		"name with slash":      bad(func(v *View) { v.Name = "a/b" }),
 		"no password":          bad(func(v *View) { v.Password = "" }),
 		"unknown feed":         bad(func(v *View) { v.Feed = "nope" }),
 		"username of feed":     bad(func(v *View) { v.Username = "alice" }),

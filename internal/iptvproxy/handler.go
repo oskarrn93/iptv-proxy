@@ -99,6 +99,13 @@ func (p *Proxy) Mux() *http.ServeMux {
 	admin("GET /admin/shares", p.handleListShares)
 	admin("POST /admin/shares", p.handleCreateShare)
 	admin("DELETE /admin/shares/{token}", p.handleRevokeShare)
+	admin("GET /admin/views", p.requireViews(p.handleAdminViewsPage))
+	admin("GET /admin/views/list", p.requireViews(p.handleAdminViewList))
+	admin("GET /admin/views/editor", p.requireViews(p.handleAdminViewEditor))
+	admin("POST /admin/views", p.requireViews(p.handleAdminViewSave))
+	admin("POST /admin/views/preview", p.requireViews(p.handleAdminViewPreview))
+	admin("POST /admin/views/toggle", p.requireViews(p.handleAdminViewToggle))
+	admin("DELETE /admin/views/{name}", p.requireViews(p.handleAdminViewDelete))
 	mux.HandleFunc("/{prefix}/{username}/{password}/{rest...}", p.withRequestLogger(p.handleStream))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, max-age=0")

@@ -80,6 +80,19 @@ admin_auth:
 
 Over plain HTTP, the password and share links are unencrypted, so only use `admin_auth` without TLS on a network you trust.
 
+## Views
+
+A view is a separate login that sees only the channels of one feed that its rules allow, for example one household member's picks. Set `views_file` and manage views at `/admin/views`:
+
+```yaml
+views_file: /data/views.json
+```
+
+- **Rules:** regexes on channel name, group or `tvg-id` to include or exclude, plus channels you pin (always shown) or block (never shown). Blocked beats pinned beats exclude beats include.
+- **Re-matching:** rules are stored, not their results. When the upstream playlist changes, the view follows. The editor's preview flags pins and blocks that no longer match any channel.
+- **Where it applies:** the M3U playlist, `player_api.php` live streams and categories, and stream playback (a view can't play a channel it doesn't list). VOD, series and the EPG are not filtered.
+- **Storage:** views live in `views_file` (JSON, owner-only, passwords included). The proxy is the only writer, so run a single instance.
+
 ## Development
 
 Requires Go 1.27.
