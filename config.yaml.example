@@ -54,6 +54,17 @@ client_buffer:
 # admin_auth:
 #   username: admin
 #   password: change-me
+# - Or log in through an OpenID Connect provider (authorization code flow with
+#   PKCE; mutually exclusive with admin_auth). Register redirect_url with the
+#   provider. allowed_emails is required, and the provider must report the
+#   address as verified. A client_secret is only needed if the provider
+#   insists on one.
+# admin_oidc:
+#   issuer: https://idp.example.com
+#   client_id: iptv-proxy
+#   redirect_url: https://iptv.example.com/admin/oidc/callback
+#   allowed_emails:
+#     - you@example.com
 
 # Curated views: extra credential pairs that see only part of a feed. Views are
 # stored in this JSON file (created owner-only; its directory must exist) and

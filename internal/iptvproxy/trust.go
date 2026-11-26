@@ -117,6 +117,12 @@ func (t trustPolicy) stripUntrustedForwarded(r *http.Request) {
 // an admin visits could mint or revoke shares.
 var adminCrossOrigin = http.NewCrossOriginProtection()
 
+// hasOwnAdminLogin reports whether this proxy authenticates admin users
+// itself, so it needn't rely on a trusted reverse proxy having done it.
+func (p *Proxy) hasOwnAdminLogin() bool {
+	return p.adminAuth != nil || p.oidc != nil
+}
+
 // adminOnly gates every /admin/* route. The original client must be inside
 // admin_allowed_cidrs, checked first so nobody outside it can probe the login.
 //
@@ -130,10 +136,13 @@ func (p *Proxy) adminOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		logger := loggerFromContext(r.Context(), p.logger)
 		client, ok := p.trust.clientAddr(r)
-		if !ok || !containsAddr(p.trust.adminAllowed, client) || (p.adminAuth == nil && !p.trust.peerTrusted(r)) {
+		if !ok || !containsAddr(p.trust.adminAllowed, client) || (!p.hasOwnAdminLogin() && !p.trust.peerTrusted(r)) {
 			logger.WarnContext(r.Context(), "admin request denied",
 				"path", r.URL.Path, "remote_addr", r.RemoteAddr, "client", client.String())
 			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if p.oidc != nil && !p.oidc.authorize(w, r) {
 			return
 		}
 		if p.adminAuth != nil {

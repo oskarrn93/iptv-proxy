@@ -39,6 +39,9 @@ type Config struct {
 	// AdminAuth requires this HTTP Basic login on every /admin/* request, for
 	// running without an authenticating reverse proxy.
 	AdminAuth *Credentials `yaml:"admin_auth"`
+	// AdminOIDC logs admin users in through an OpenID Connect provider, as an
+	// alternative to AdminAuth (set one or the other).
+	AdminOIDC *OIDCConfig `yaml:"admin_oidc"`
 	// ViewsFile is the JSON file curated views (see viewStore) are persisted
 	// to. Empty disables views. The file holds view passwords, so it is
 	// created owner-only and its directory must already exist.
