@@ -32,7 +32,8 @@ type Proxy struct {
 	// adminAuth is the optional /admin/* login (see adminOnly).
 	adminAuth *Credentials
 	// views is nil unless views_file is configured.
-	views *viewStore
+	views         *viewStore
+	viewPlaylists viewPlaylists
 }
 
 func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, error) {
@@ -224,26 +225,49 @@ func requestCredentials(r *http.Request) Credentials {
 // to pick which one serves it. A username that matches a known feed but the
 // wrong password counts an auth failure against that feed's own metrics; a
 // username matching no feed at all is logged but not attributed to any feed.
-func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) *feedService {
-	f, candidate := p.matchFeed(requestCredentials(r))
+func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) (*feedService, *resolvedView) {
+	f, v, candidate := p.matchPrincipal(requestCredentials(r))
 	if f == nil {
 		p.rejectUnauthorized(w, r, candidate)
-		return nil
+		return nil, nil
 	}
-	return f
+	return f, v
+}
+
+// matchPrincipal resolves credentials to a feed, and additionally to a view
+// when they are a view's own: the view then serves the feed's content
+// restricted by its rules. Feed credentials win, though validation keeps the
+// two namespaces disjoint anyway.
+func (p *Proxy) matchPrincipal(creds Credentials) (f *feedService, v *resolvedView, candidate *feedService) {
+	f, candidate = p.matchFeed(creds)
+	if f != nil || p.views == nil {
+		return f, nil, candidate
+	}
+	matched, near := p.views.Match(creds)
+	if matched != nil {
+		return p.feedByName(matched.Feed), matched, nil
+	}
+	if candidate == nil && near != nil {
+		candidate = p.feedByName(near.Feed)
+	}
+	return nil, nil, candidate
 }
 
 // handlePlaylist serves the matched feed's own top-level playlist (its
 // configured upstream_url). Clients point their IPTV app at this proxy
 // instead of the real upstream, with credentials picking which feed.
 func (p *Proxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
-	f := p.authenticate(w, r)
+	f, v := p.authenticate(w, r)
 	if f == nil {
 		return
 	}
 	f.instrument(routePlaylist, requestHost(r), w, func(w http.ResponseWriter) {
 		loggerFromContext(r.Context(), f.logger).InfoContext(r.Context(), "playlist request",
 			"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr, "host", requestHost(r))
+		if v != nil {
+			p.serveViewPlaylist(r.Context(), w, r.Header, requestBaseURL(r), f, v)
+			return
+		}
 		f.servePlaylist(r.Context(), w, r.Header, requestBaseURL(r))
 	})
 }
@@ -253,7 +277,7 @@ func (p *Proxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 // credential resolution as handlePlaylist, so an IPTV app can point its EPG
 // URL at this proxy with the same feed credentials it uses for the playlist.
 func (p *Proxy) handleEPG(w http.ResponseWriter, r *http.Request) {
-	f := p.authenticate(w, r)
+	f, _ := p.authenticate(w, r)
 	if f == nil {
 		return
 	}
@@ -271,8 +295,12 @@ func (p *Proxy) handleEPG(w http.ResponseWriter, r *http.Request) {
 // it would against the real upstream, without ever seeing the upstream's own
 // host or credentials.
 func (p *Proxy) handleXtreamAPI(w http.ResponseWriter, r *http.Request) {
-	f := p.authenticate(w, r)
+	f, v := p.authenticate(w, r)
 	if f == nil {
+		return
+	}
+	if v != nil {
+		http.Error(w, "xtream api is not available to views", http.StatusNotImplemented)
 		return
 	}
 	f.instrument(routeXtreamAPI, requestHost(r), w, func(w http.ResponseWriter) {
@@ -291,7 +319,7 @@ func (p *Proxy) handleXtreamAPI(w http.ResponseWriter, r *http.Request) {
 // standard Xtream stream URL; the feed's configured upstream is what turns the
 // rest back into a URL to fetch (see streamTarget).
 func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request) {
-	f, candidate := p.matchFeed(Credentials{
+	f, v, candidate := p.matchPrincipal(Credentials{
 		Username: r.PathValue("username"),
 		Password: r.PathValue("password"),
 	})
@@ -301,6 +329,10 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	prefix := r.PathValue("prefix")
+	if v != nil && !p.viewMayStream(r, f, v, prefix) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
 	target := f.streamTarget(prefix, r.PathValue("rest"), r.URL.RawQuery)
 
 	kind := classifySessionKind(prefix)
