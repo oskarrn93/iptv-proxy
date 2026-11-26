@@ -96,6 +96,8 @@ Over plain HTTP, the password and share links are unencrypted, so only use `admi
 
 A view is a separate login that sees only the channels of one feed that its rules allow, for example one household member's picks. Set `views_file` and manage views at `/admin/views`:
 
+![Views page with the view list and the editor](docs/screenshots/admin-views.png)
+
 ```yaml
 views_file: /data/views.json
 ```

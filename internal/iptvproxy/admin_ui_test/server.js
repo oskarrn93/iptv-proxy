@@ -16,6 +16,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const ADMIN_HTML_PATH = path.join(__dirname, "..", "admin.html");
+const VIEWS_HTML_PATH = path.join(__dirname, "..", "admin_views.html");
 const STATIC_DIR = path.join(__dirname, "..", "static");
 const STATIC_PREFIX = "/admin/static/";
 const STATIC_TYPES = { ".js": "application/javascript", ".css": "text/css" };
@@ -30,6 +31,11 @@ function startServer(routes) {
     if (url.pathname === "/") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(fs.readFileSync(ADMIN_HTML_PATH, "utf8"));
+      return;
+    }
+    if (url.pathname === "/views") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(fs.readFileSync(VIEWS_HTML_PATH, "utf8"));
       return;
     }
     if (url.pathname.startsWith(STATIC_PREFIX)) {
