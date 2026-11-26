@@ -361,8 +361,15 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request) {
 	f.metrics.sessionStarted(kind)
 	defer f.metrics.sessionEnded(kind)
 
+	// Nested playlist links are written with the serving feedService's
+	// credentials, so a view must serve as itself or it would hand its client
+	// the feed's own login.
+	svc := f
+	if v != nil {
+		svc = f.forView(v.Credentials)
+	}
 	f.instrument(routeStream, requestHost(r), w, func(w http.ResponseWriter) {
-		f.serve(r.Context(), w, r.Header, target, requestBaseURL(r))
+		svc.serve(r.Context(), w, r.Header, target, requestBaseURL(r))
 	})
 }
 

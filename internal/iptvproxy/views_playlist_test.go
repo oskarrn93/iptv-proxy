@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -28,6 +29,11 @@ func newViewProxy(t *testing.T, rules curation.Rules) (*Proxy, *httptest.Server)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/get.php" {
 			io.WriteString(w, viewTestPlaylist)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, ".m3u8") {
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			io.WriteString(w, "#EXTM3U\n#EXTINF:4,\nseg1.ts\n")
 			return
 		}
 		io.WriteString(w, "stream-bytes")
@@ -96,6 +102,11 @@ func TestView_StreamGate(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, get(p, "/live/viewer/vpw/%31%30%31.ts").Code, "percent-encoding must not bypass the gate")
 	assert.Equal(t, http.StatusOK, get(p, "/hls/viewer/vpw/segment-9.ts").Code, "links that are not listed channels pass")
 
+	assert.Equal(t, http.StatusNotFound, get(p, "/bare-creds/viewer/vpw/101").Code, "the short live form of a denied channel")
+	assert.Equal(t, http.StatusNotFound, get(p, "/timeshift/viewer/vpw/60/2026-01-01:00-00/101.ts").Code, "catch-up of a denied channel")
+	assert.Equal(t, http.StatusOK, get(p, "/bare-creds/viewer/vpw/102").Code)
+	assert.Equal(t, http.StatusNotFound, get(p, "/live/viewer/vpw/999.ts").Code, "a live channel the playlist doesn't list")
+
 	assert.Equal(t, http.StatusOK, get(p, "/live/alice/secret/101.ts").Code, "the feed itself is unfiltered")
 	assert.Equal(t, http.StatusUnauthorized, get(p, "/live/viewer/wrong/102.ts").Code)
 }
@@ -129,4 +140,16 @@ func TestBuildViewPlaylist_SwapsCredentialsInTagsInsideAnEntry(t *testing.T) {
 	vp := buildViewPlaylist(body, m, Credentials{Username: "alice", Password: "secret"}, Credentials{Username: "viewer", Password: "vpw"})
 	assert.NotContains(t, vp.body, "alice")
 	assert.Contains(t, vp.body, "/stream/viewer/vpw/key")
+}
+
+func TestView_NestedPlaylistLinksCarryTheViewsCredentials(t *testing.T) {
+	p, _ := newViewProxy(t, curation.Rules{})
+	get(p, "/playlist.m3u8?username=viewer&password=vpw")
+
+	rec := get(p, "/live/viewer/vpw/102.m3u8")
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "/live/viewer/vpw/seg1.ts")
+	for _, leak := range []string{"alice", "secret", "u1", "p1"} {
+		assert.NotContains(t, rec.Body.String(), leak)
+	}
 }

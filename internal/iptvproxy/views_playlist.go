@@ -16,19 +16,28 @@ import (
 // the set of channels it must not be able to play.
 type viewPlaylist struct {
 	body string
-	// denied holds streamKey of every channel the playlist lists but the view
-	// does not allow.
-	denied map[string]struct{}
+	// channels maps streamKey of every channel the playlist lists to whether
+	// the view may play it.
+	channels map[string]bool
 }
 
 // streamKey identifies a channel independent of how a client spells its link:
 // rest must already be percent-decoded, and the extension is normalized away,
 // because Xtream clients routinely ask for 1234.m3u8 where the playlist says
-// 1234.ts, and a gate keyed on the exact link would let a denied channel
-// through that way.
-func streamKey(prefix, rest string) string {
-	rest = strings.TrimSuffix(rest, path.Ext(rest))
-	return prefix + "/" + rest
+// 1234.ts. The Xtream live forms of one stream id (/live/u/p/ID.ts,
+// /u/p/ID, /timeshift/u/p/<duration>/<start>/ID.ts) share one key, so a
+// channel can't be reached through a sibling URL shape. isChannel reports
+// whether the link has one of those forms.
+func streamKey(prefix, rest string) (key string, isChannel bool) {
+	segments := strings.Split(rest, "/")
+	last := segments[len(segments)-1]
+	stem := strings.TrimSuffix(last, path.Ext(last))
+	switch {
+	case (prefix == "live" || prefix == bareCredsStreamPrefix) && len(segments) == 1,
+		prefix == "timeshift" && len(segments) == 3:
+		return "live/" + stem, true
+	}
+	return prefix + "/" + strings.TrimSuffix(rest, path.Ext(rest)), false
 }
 
 // linkParts splits a rewritten link line, which always has the shape
@@ -110,7 +119,7 @@ func buildViewPlaylist(body string, m *curation.Matcher, feed, view Credentials)
 				if unescaped, err := url.PathUnescape(rest); err == nil {
 					rest = unescaped
 				}
-				key := streamKey(prefix, rest)
+				key, _ := streamKey(prefix, rest)
 				allowed[key] = allowed[key] || ok
 			}
 			if ok {
@@ -125,13 +134,7 @@ func buildViewPlaylist(body string, m *curation.Matcher, feed, view Credentials)
 		}
 	}
 
-	vp := &viewPlaylist{body: strings.Clone(out.String()), denied: map[string]struct{}{}}
-	for key, ok := range allowed {
-		if !ok {
-			vp.denied[key] = struct{}{}
-		}
-	}
-	return vp
+	return &viewPlaylist{body: strings.Clone(out.String()), channels: allowed}
 }
 
 // viewPlaylists memoizes buildViewPlaylist per view. The cached feed playlist
@@ -190,10 +193,10 @@ func (p *Proxy) serveViewPlaylist(ctx context.Context, w http.ResponseWriter, he
 }
 
 // viewMayStream reports whether the view may play the stream link r asks for.
-// A channel the feed's playlist lists but the view's rules exclude is refused,
-// so guessing or remembering an unlisted channel's URL gets a view nowhere.
-// Links the playlist doesn't list as channels (HLS segments, sub-playlists)
-// pass: they belong to a channel the view already reached.
+// A live channel the view's rules exclude, or the playlist doesn't list, is
+// refused, so guessing or remembering its URL gets a view nowhere. Links that
+// aren't live channel forms (HLS segments, sub-playlists) pass: they belong to
+// a channel the view already reached.
 func (p *Proxy) viewMayStream(r *http.Request, f *feedService, v *resolvedView, prefix string) bool {
 	result, err := f.getPlaylist(r.Context(), r.Header)
 	if err != nil {
@@ -202,6 +205,11 @@ func (p *Proxy) viewMayStream(r *http.Request, f *feedService, v *resolvedView, 
 		return false
 	}
 	vp := p.viewPlaylists.get(v, f, result.body)
-	_, denied := vp.denied[streamKey(prefix, r.PathValue("rest"))]
-	return !denied
+	key, isChannel := streamKey(prefix, r.PathValue("rest"))
+	if allowed, listed := vp.channels[key]; listed {
+		return allowed
+	}
+	// A live channel the playlist doesn't list (say, one the feed's
+	// exclude_group_prefixes dropped) isn't one the view's rules ever allowed.
+	return !isChannel
 }
