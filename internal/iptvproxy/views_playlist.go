@@ -115,8 +115,7 @@ func buildViewPlaylist(body string, m *curation.Matcher, feed, view Credentials)
 			}
 			if ok {
 				for _, p := range pending {
-					out.WriteString(p)
-					out.WriteByte('\n')
+					writeLine(p)
 				}
 				writeLine(line)
 			}

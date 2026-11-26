@@ -119,3 +119,14 @@ func TestSwapLinkCredentials(t *testing.T) {
 	assert.Equal(t, `#EXT-X-KEY:URI="`+p+`/stream/x/y/k",IV=0`, swapLinkCredentials(`#EXT-X-KEY:URI="`+p+`/stream/a/b/k",IV=0`, from, to))
 	assert.Equal(t, "#EXTINF:-1,/a/b/ show", swapLinkCredentials("#EXTINF:-1,/a/b/ show", from, to), "free text is never touched")
 }
+
+func TestBuildViewPlaylist_SwapsCredentialsInTagsInsideAnEntry(t *testing.T) {
+	m, err := curation.Compile(curation.Rules{})
+	require.NoError(t, err)
+	p := baseURLPlaceholder
+	body := "#EXTINF:-1,A\n#EXT-X-KEY:METHOD=AES-128,URI=\"" + p + "/stream/alice/secret/key\"\n" + p + "/live/alice/secret/1.ts\n"
+
+	vp := buildViewPlaylist(body, m, Credentials{Username: "alice", Password: "secret"}, Credentials{Username: "viewer", Password: "vpw"})
+	assert.NotContains(t, vp.body, "alice")
+	assert.Contains(t, vp.body, "/stream/viewer/vpw/key")
+}
