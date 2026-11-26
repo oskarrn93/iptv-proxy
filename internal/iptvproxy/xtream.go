@@ -49,7 +49,36 @@ func (s *feedService) xtreamAPITarget(rawQuery string) *url.URL {
 // per-VOD/series lookup, a category filter), so there is no single stable
 // target to coalesce concurrent requests onto the way servePlaylist/serveEPG
 // do for their one fixed upstream URL.
-func (s *feedService) serveXtreamAPI(reqCtx context.Context, w http.ResponseWriter, reqHeader http.Header, rawQuery, baseURL string) {
+func (s *feedService) serveXtreamAPI(reqCtx context.Context, w http.ResponseWriter, reqHeader http.Header, rawQuery, baseURL string, filter xtreamFilter) {
+	logger := loggerFromContext(reqCtx, s.logger)
+
+	status, body, pfErr := s.fetchXtreamAPI(reqCtx, reqHeader, rawQuery)
+	if pfErr != nil {
+		writeUpstreamError(w, pfErr)
+		return
+	}
+
+	out, err := s.rewriteXtreamAPIBody(reqCtx, body, baseURL, filter)
+	if err != nil {
+		logger.ErrorContext(reqCtx, "xtream api filter failed", "error", redactErr(err))
+		writeUpstreamError(w, &playlistFetchError{status: http.StatusBadGateway, msg: "filter failed"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(status)
+	_, _ = w.Write(out)
+}
+
+// xtreamFilter narrows a decoded player_api.php response before it is
+// rewritten; a view uses it to drop channels its rules exclude. An error means
+// the response could not be filtered and must not be served.
+type xtreamFilter func(parsed interface{}) (interface{}, error)
+
+// fetchXtreamAPI performs one upstream player_api.php call for the client's
+// query and returns its status and raw body.
+func (s *feedService) fetchXtreamAPI(reqCtx context.Context, reqHeader http.Header, rawQuery string) (int, []byte, *playlistFetchError) {
 	logger := loggerFromContext(reqCtx, s.logger)
 	target := s.xtreamAPITarget(rawQuery)
 
@@ -58,35 +87,28 @@ func (s *feedService) serveXtreamAPI(reqCtx context.Context, w http.ResponseWrit
 
 	resp, err := s.repo.fetchWithRetry(tctx, target.String(), reqHeader)
 	if err != nil {
-		writeUpstreamError(w, s.upstreamFailure(tctx, err))
-		return
+		return 0, nil, s.upstreamFailure(tctx, err)
 	}
 	defer resp.Body.Close()
 
 	if pfErr := s.upstreamStatusFailure(tctx, target, resp); pfErr != nil {
-		writeUpstreamError(w, pfErr)
-		return
+		return 0, nil, pfErr
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxXtreamAPIBody+1))
 	if err != nil {
 		logger.ErrorContext(reqCtx, "xtream api read failed", "error", redactErr(err))
-		writeUpstreamError(w, &playlistFetchError{status: http.StatusBadGateway, msg: "read failed"})
-		return
+		return 0, nil, &playlistFetchError{status: http.StatusBadGateway, msg: "read failed"}
 	}
 
 	// Truncated JSON would fail to parse and take the unrewritten passthrough
-	// below, handing the client whatever upstream URLs it holds.
+	// in rewriteXtreamAPIBody, handing the client whatever upstream URLs it
+	// holds.
 	if len(body) > maxXtreamAPIBody {
 		logger.ErrorContext(reqCtx, "xtream api response too large to rewrite", "limit", maxXtreamAPIBody)
-		writeUpstreamError(w, &playlistFetchError{status: http.StatusBadGateway, msg: "upstream response too large"})
-		return
+		return 0, nil, &playlistFetchError{status: http.StatusBadGateway, msg: "upstream response too large"}
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(s.rewriteXtreamAPIBody(reqCtx, body, baseURL))
+	return resp.StatusCode, body, nil
 }
 
 // rewriteXtreamAPIBody rewrites a player_api.php JSON response so it never
@@ -99,19 +121,33 @@ func (s *feedService) serveXtreamAPI(reqCtx context.Context, w http.ResponseWrit
 // rewriteXtreamURLString). A body that isn't valid JSON (an upstream error
 // page, an empty response) is passed through unrewritten rather than dropped,
 // so the client still sees whatever the upstream actually said.
-func (s *feedService) rewriteXtreamAPIBody(ctx context.Context, body []byte, baseURL string) []byte {
+func (s *feedService) rewriteXtreamAPIBody(ctx context.Context, body []byte, baseURL string, filter xtreamFilter) ([]byte, error) {
 	var parsed interface{}
 	if err := json.Unmarshal(body, &parsed); err != nil {
+		// A view's filter can't run on a body it can't read, and an unfiltered
+		// passthrough would show it everything.
+		if filter != nil {
+			return nil, err
+		}
 		loggerFromContext(ctx, s.logger).WarnContext(ctx, "xtream api response not JSON, passing through unrewritten", "error", err)
-		return body
+		return body, nil
+	}
+	if filter != nil {
+		var err error
+		if parsed, err = filter(parsed); err != nil {
+			return nil, err
+		}
 	}
 
 	rewritten, err := json.Marshal(s.rewriteXtreamValue(parsed, baseURL))
 	if err != nil {
 		loggerFromContext(ctx, s.logger).ErrorContext(ctx, "xtream api response re-encode failed, passing through unrewritten", "error", err)
-		return body
+		if filter != nil {
+			return nil, err
+		}
+		return body, nil
 	}
-	return rewritten
+	return rewritten, nil
 }
 
 // rewriteXtreamValue walks a decoded player_api.php JSON value (object,
