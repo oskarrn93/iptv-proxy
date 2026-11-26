@@ -31,6 +31,8 @@ type Proxy struct {
 	trust trustPolicy
 	// adminAuth is the optional /admin/* login (see adminOnly).
 	adminAuth *Credentials
+	// views is nil unless views_file is configured.
+	views *viewStore
 }
 
 func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, error) {
@@ -59,6 +61,12 @@ func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, er
 			return nil, fmt.Errorf("feed %q: %w", feedCfg.Name, err)
 		}
 		p.feeds = append(p.feeds, svc)
+	}
+
+	if cfg.ViewsFile != "" {
+		if p.views, err = newViewStore(cfg.ViewsFile, cfg.Feeds); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(gatherers) == 0 {
