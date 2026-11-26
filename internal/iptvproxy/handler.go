@@ -299,14 +299,14 @@ func (p *Proxy) handleXtreamAPI(w http.ResponseWriter, r *http.Request) {
 	if f == nil {
 		return
 	}
-	if v != nil {
-		http.Error(w, "xtream api is not available to views", http.StatusNotImplemented)
-		return
-	}
 	f.instrument(routeXtreamAPI, requestHost(r), w, func(w http.ResponseWriter) {
 		loggerFromContext(r.Context(), f.logger).InfoContext(r.Context(), "xtream api request",
 			"method", r.Method, "path", r.URL.Path, "action", r.URL.Query().Get("action"), "remote_addr", r.RemoteAddr, "host", requestHost(r))
-		f.serveXtreamAPI(r.Context(), w, r.Header, r.URL.RawQuery, requestBaseURL(r))
+		if v != nil {
+			p.serveViewXtreamAPI(r.Context(), w, r.Header, r.URL.RawQuery, requestBaseURL(r), f, v)
+			return
+		}
+		f.serveXtreamAPI(r.Context(), w, r.Header, r.URL.RawQuery, requestBaseURL(r), nil)
 	})
 }
 

@@ -91,6 +91,19 @@ type Matcher struct {
 	pinned, blocked  map[string]struct{}
 }
 
+// UsesGroup reports whether any pattern looks at the group, so a caller that
+// has to look group names up can skip the lookup when no rule needs it.
+func (m *Matcher) UsesGroup() bool {
+	for _, ps := range [][]compiledPattern{m.include, m.exclude} {
+		for _, p := range ps {
+			if p.field == FieldGroup {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func compile(ps []Pattern) ([]compiledPattern, error) {
 	out := make([]compiledPattern, 0, len(ps))
 	for _, p := range ps {
