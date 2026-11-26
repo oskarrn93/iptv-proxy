@@ -3,6 +3,7 @@ package iptvproxy
 import (
 	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,6 +32,8 @@ type Proxy struct {
 	trust trustPolicy
 	// adminAuth is the optional /admin/* login (see adminOnly).
 	adminAuth *Credentials
+	// oidc is the optional /admin/* OpenID Connect login (see adminOnly).
+	oidc *adminOIDC
 	// views is nil unless views_file is configured.
 	views         *viewStore
 	viewPlaylists viewPlaylists
@@ -42,8 +45,16 @@ func NewProxy(cfg *Config, logger *slog.Logger, metricsEnabled bool) (*Proxy, er
 		return nil, fmt.Errorf("trust config: %w", err)
 	}
 	p := &Proxy{logger: logger, shares: newShareStore(), trust: trust, adminAuth: cfg.AdminAuth}
-	if len(cfg.AdminAllowedCIDRs) == 0 || (len(cfg.TrustedProxies) == 0 && cfg.AdminAuth == nil) {
-		logger.Warn("admin UI disabled: set admin_allowed_cidrs and either trusted_proxies or admin_auth in config.yaml to enable it")
+	if cfg.AdminOIDC != nil {
+		if cfg.AdminAuth != nil {
+			return nil, errors.New("admin_auth and admin_oidc are mutually exclusive")
+		}
+		if p.oidc, err = newAdminOIDC(cfg.AdminOIDC); err != nil {
+			return nil, fmt.Errorf("admin_oidc: %w", err)
+		}
+	}
+	if len(cfg.AdminAllowedCIDRs) == 0 || (len(cfg.TrustedProxies) == 0 && !p.hasOwnAdminLogin()) {
+		logger.Warn("admin UI disabled: set admin_allowed_cidrs and one of trusted_proxies, admin_auth or admin_oidc in config.yaml to enable it")
 	}
 
 	// Gatherers merges every feed's own registry into one /metrics response
@@ -92,6 +103,10 @@ func (p *Proxy) Mux() *http.ServeMux {
 	mux.HandleFunc("/player_api.php", p.withRequestLogger(p.handleXtreamAPI))
 	mux.HandleFunc("/panel_api.php", p.withRequestLogger(p.handleXtreamAPI))
 	mux.HandleFunc("/share/{token}", p.withRequestLogger(p.handleShare))
+	if p.oidc != nil {
+		admin("GET "+oidcLoginPath, p.handleOIDCLogin)
+		admin("GET "+oidcCallbackPath, p.handleOIDCCallback)
+	}
 	admin("/admin", p.handleAdminPage)
 	admin("/admin/static/{file}", p.handleAdminStatic)
 	admin("/admin/feeds", p.handleAdminFeeds)

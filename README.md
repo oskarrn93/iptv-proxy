@@ -65,10 +65,11 @@ HTTP Basic Auth also works in place of the query parameters.
 
 ![Admin page with a new share link and the active shares table](docs/screenshots/admin.png)
 
-`/admin` creates and revokes share links. It's disabled unless `admin_allowed_cidrs` is set, and only clients in those ranges can reach it. Protect it in one of two ways:
+`/admin` creates and revokes share links. It's disabled unless `admin_allowed_cidrs` is set, and only clients in those ranges can reach it. Protect it in one of three ways:
 
 - **Authenticating reverse proxy:** set `trusted_proxies`, and the app only answers requests that arrive through one of those proxies.
 - **No reverse proxy:** set `admin_auth` to require an HTTP Basic login on every admin request.
+- **OpenID Connect:** set `admin_oidc` to log in through your identity provider (authorization code flow with PKCE). It replaces `admin_auth`; set one or the other.
 
 ```yaml
 admin_allowed_cidrs:
@@ -77,6 +78,17 @@ admin_auth:
   username: admin
   password: change-me
 ```
+
+```yaml
+admin_oidc:
+  issuer: https://idp.example.com
+  client_id: iptv-proxy
+  redirect_url: https://iptv.example.com/admin/oidc/callback # register this with the provider
+  allowed_emails:
+    - you@example.com
+```
+
+Only the listed emails get in, and only if the provider reports them as verified. Sessions last 8 hours and end when the proxy restarts. `client_secret` is optional, for providers that insist on one.
 
 Over plain HTTP, the password and share links are unencrypted, so only use `admin_auth` without TLS on a network you trust.
 
