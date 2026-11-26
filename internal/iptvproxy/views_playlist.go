@@ -7,7 +7,6 @@ import (
 	"path"
 	"strings"
 	"sync"
-	"unsafe"
 
 	"github.com/oskarrn93/iptv-proxy/internal/iptvproxy/curation"
 )
@@ -82,13 +81,19 @@ func swapLinkCredentials(line string, from, to Credentials) string {
 // outside a block (headers, #EXT-X tags) passes through untouched, as RFC 8216
 // requires of line order.
 func buildViewPlaylist(body string, m *curation.Matcher, feed, view Credentials) *viewPlaylist {
-	vp := &viewPlaylist{denied: map[string]struct{}{}}
 	var out strings.Builder
 	out.Grow(len(body))
+	writeLine := func(line string) {
+		out.WriteString(swapLinkCredentials(line, feed, view))
+		out.WriteByte('\n')
+	}
 
+	// allowed per channel key; a key shared by an allowed and a denied entry
+	// (links differing only by query) can't be told apart by path, so allowed
+	// wins.
+	allowed := map[string]bool{}
 	var pending []string
 	var extinf string
-	allowed := map[string]struct{}{}
 
 	for raw := range strings.Lines(body) {
 		line := strings.TrimRight(raw, "\r\n")
@@ -100,40 +105,33 @@ func buildViewPlaylist(body string, m *curation.Matcher, feed, view Credentials)
 		case pending != nil && (trimmed == "" || strings.HasPrefix(trimmed, "#")):
 			pending = append(pending, line)
 		case pending != nil:
-			entry := curation.ParseEntry(extinf, trimmed)
-			prefix, rest, isLink := linkParts(trimmed)
-			ok := m.Allow(entry)
-			if isLink {
+			ok := m.Allow(curation.ParseEntry(extinf, trimmed))
+			if prefix, rest, isLink := linkParts(trimmed); isLink {
 				if unescaped, err := url.PathUnescape(rest); err == nil {
 					rest = unescaped
 				}
 				key := streamKey(prefix, rest)
-				if ok {
-					allowed[key] = struct{}{}
-				} else {
-					vp.denied[key] = struct{}{}
-				}
+				allowed[key] = allowed[key] || ok
 			}
 			if ok {
 				for _, p := range pending {
 					out.WriteString(p)
 					out.WriteByte('\n')
 				}
-				out.WriteString(swapLinkCredentials(line, feed, view))
-				out.WriteByte('\n')
+				writeLine(line)
 			}
 			pending = nil
 		default:
-			out.WriteString(swapLinkCredentials(line, feed, view))
-			out.WriteByte('\n')
+			writeLine(line)
 		}
 	}
-	// A key shared by an allowed and a denied entry (links differing only by
-	// query) can't be told apart by path, so the allowed entry wins.
-	for k := range allowed {
-		delete(vp.denied, k)
+
+	vp := &viewPlaylist{body: strings.Clone(out.String()), denied: map[string]struct{}{}}
+	for key, ok := range allowed {
+		if !ok {
+			vp.denied[key] = struct{}{}
+		}
 	}
-	vp.body = strings.Clone(out.String())
 	return vp
 }
 
@@ -143,14 +141,17 @@ func buildViewPlaylist(body string, m *curation.Matcher, feed, view Credentials)
 // nothing.
 type viewPlaylists struct {
 	mu    sync.Mutex
-	items map[string]viewPlaylistEntry
+	items map[string]*viewPlaylistEntry
 }
 
+// viewPlaylistEntry has its own lock so one view's rebuild doesn't stall
+// every other view's requests behind the map lock.
 type viewPlaylistEntry struct {
-	// A new feed playlist or edited rules change these, which is what
-	// invalidates the entry; identity is enough because both are immutable.
-	body    *byte
-	bodyLen int
+	mu sync.Mutex
+	// A new feed playlist, edited rules or new credentials invalidate the
+	// entry. Comparing body costs a pointer check while the feed cache still
+	// serves the same string.
+	body    string
 	matcher *curation.Matcher
 	creds   Credentials
 	value   *viewPlaylist
@@ -158,17 +159,23 @@ type viewPlaylistEntry struct {
 
 func (c *viewPlaylists) get(v *resolvedView, feed *feedService, body string) *viewPlaylist {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.items == nil {
-		c.items = map[string]viewPlaylistEntry{}
+		c.items = map[string]*viewPlaylistEntry{}
 	}
-	e, ok := c.items[v.Name]
-	if ok && e.body == unsafe.StringData(body) && e.bodyLen == len(body) && e.matcher == v.Matcher && e.creds == v.Credentials {
-		return e.value
+	e := c.items[v.Name]
+	if e == nil {
+		e = &viewPlaylistEntry{}
+		c.items[v.Name] = e
 	}
-	value := buildViewPlaylist(body, v.Matcher, feed.creds, v.Credentials)
-	c.items[v.Name] = viewPlaylistEntry{unsafe.StringData(body), len(body), v.Matcher, v.Credentials, value}
-	return value
+	c.mu.Unlock()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.value == nil || e.matcher != v.Matcher || e.creds != v.Credentials || e.body != body {
+		e.value = buildViewPlaylist(body, v.Matcher, feed.creds, v.Credentials)
+		e.body, e.matcher, e.creds = body, v.Matcher, v.Credentials
+	}
+	return e.value
 }
 
 // serveViewPlaylist serves the view's filtered copy of the feed's cached

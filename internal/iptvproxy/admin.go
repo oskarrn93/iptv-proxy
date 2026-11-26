@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"path"
 	"strings"
+
+	"github.com/oskarrn93/iptv-proxy/internal/iptvproxy/curation"
 )
 
 // adminPageHTML is the static admin UI (see admin.html): pick a feed, pick
@@ -163,7 +165,7 @@ func parseChannelEntries(body string) []channelEntry {
 		line := strings.TrimSpace(raw)
 		switch {
 		case strings.HasPrefix(line, "#EXTINF"):
-			pendingName = extinfDisplayName(line)
+			pendingName = curation.DisplayName(line)
 			havePending = true
 		case line == "" || strings.HasPrefix(line, "#"):
 			continue
@@ -175,14 +177,4 @@ func parseChannelEntries(body string) []channelEntry {
 		}
 	}
 	return entries
-}
-
-// extinfDisplayName returns the channel name from a #EXTINF line: the text
-// after its last comma, per the M3U EXTINF format (duration,title — any
-// tvg-* attributes precede the comma, never follow it).
-func extinfDisplayName(line string) string {
-	if idx := strings.LastIndex(line, ","); idx != -1 && idx+1 < len(line) {
-		return strings.TrimSpace(line[idx+1:])
-	}
-	return line
 }

@@ -1,9 +1,7 @@
 package iptvproxy
 
 import (
-	"crypto/rand"
 	_ "embed"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -128,14 +126,6 @@ func splitLines(text string) []string {
 	return out
 }
 
-func randomToken() (string, error) {
-	b := make([]byte, 12)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
-}
-
 // rulesFromForm reads the editor's rule fields.
 func rulesFromForm(r *http.Request) curation.Rules {
 	return curation.Rules{
@@ -162,12 +152,7 @@ func (p *Proxy) handleAdminViewSave(w http.ResponseWriter, r *http.Request) {
 	// Credentials are unguessable by default, like a feed's.
 	for _, field := range []*string{&v.Username, &v.Password} {
 		if *field == "" {
-			tok, err := randomToken()
-			if err != nil {
-				http.Error(w, "could not generate credentials", http.StatusInternalServerError)
-				return
-			}
-			*field = tok
+			*field = randHex(12)
 		}
 	}
 
@@ -201,7 +186,7 @@ func (p *Proxy) handleAdminViewDelete(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Deleted %s.", name)
 }
 
-// toggleKey adds key to the named list of the editor form (or removes it if
+// handleAdminViewToggle adds key to the named list of the editor form (or removes it if
 // present), taking it off the opposite list, and re-renders both lists.
 func (p *Proxy) handleAdminViewToggle(w http.ResponseWriter, r *http.Request) {
 	list, key := r.PostFormValue("list"), r.PostFormValue("key")
