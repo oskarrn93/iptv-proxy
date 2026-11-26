@@ -59,9 +59,12 @@ func linkParts(line string) (prefix, rest string, ok bool) {
 }
 
 // swapLinkCredentials rewrites the feed credentials in every rewritten link of
-// line (a bare URI line or a URI="..." attribute) to the view's. Only the
-// credential slots of a placeholder link are touched, never free text.
+// line (a bare URI line or a URI="..." attribute) to the view's. Only
+// placeholder links are touched, never free text. Besides the credential slot
+// after the prefix, the feed's credentials are swapped wherever
+// writeStreamURI put them: whole path segments of the rest and query values.
 func swapLinkCredentials(line string, from, to Credentials) string {
+	swap := credentialSwap{from: from, to: to}
 	var out strings.Builder
 	for {
 		before, after, found := strings.Cut(line, baseURLPlaceholder+"/")
@@ -76,12 +79,24 @@ func swapLinkCredentials(line string, from, to Credentials) string {
 			return out.String()
 		}
 		out.WriteString(prefix + "/")
-		if rest, ok := strings.CutPrefix(tail, from.Username+"/"+from.Password+"/"); ok {
-			out.WriteString(to.Username + "/" + to.Password + "/")
-			line = rest
-		} else {
+		rest, ok := strings.CutPrefix(tail, from.Username+"/"+from.Password+"/")
+		if !ok {
 			line = tail
+			continue
 		}
+		out.WriteString(to.Username + "/" + to.Password + "/")
+
+		end := strings.IndexAny(rest, "\"' \t\x00")
+		if end < 0 {
+			end = len(rest)
+		}
+		linkPath, linkQuery, _ := strings.Cut(rest[:end], "?")
+		linkPath, linkQuery = swap.apply(linkPath, linkQuery)
+		out.WriteString(linkPath)
+		if linkQuery != "" {
+			out.WriteString("?" + linkQuery)
+		}
+		line = rest[end:]
 	}
 }
 

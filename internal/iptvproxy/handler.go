@@ -325,6 +325,12 @@ func (p *Proxy) handleXtreamAPI(w http.ResponseWriter, r *http.Request) {
 		loggerFromContext(r.Context(), f.logger).InfoContext(r.Context(), "xtream api request",
 			"method", r.Method, "path", r.URL.Path, "action", r.URL.Query().Get("action"), "remote_addr", r.RemoteAddr, "host", requestHost(r))
 		if v != nil {
+			// panel_api.php answers a bare login with the full channel list
+			// (available_channels), which can't be filtered by action.
+			if r.URL.Path != xtreamAPIPath {
+				http.Error(w, "not available to views", http.StatusNotFound)
+				return
+			}
 			p.serveViewXtreamAPI(r.Context(), w, r.Header, r.URL.RawQuery, requestBaseURL(r), f, v)
 			return
 		}

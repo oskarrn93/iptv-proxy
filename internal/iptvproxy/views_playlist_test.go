@@ -129,6 +129,9 @@ func TestSwapLinkCredentials(t *testing.T) {
 	assert.Equal(t, p+"/live/x/y/1.ts", swapLinkCredentials(p+"/live/a/b/1.ts", from, to))
 	assert.Equal(t, `#EXT-X-KEY:URI="`+p+`/stream/x/y/k",IV=0`, swapLinkCredentials(`#EXT-X-KEY:URI="`+p+`/stream/a/b/k",IV=0`, from, to))
 	assert.Equal(t, "#EXTINF:-1,/a/b/ show", swapLinkCredentials("#EXTINF:-1,/a/b/ show", from, to), "free text is never touched")
+	assert.Equal(t, p+"/stream/x/y/timeshift.php?password=y&stream=1&username=x",
+		swapLinkCredentials(p+"/stream/a/b/timeshift.php?password=b&username=a&stream=1", from, to), "credentials in the query")
+	assert.Equal(t, p+"/stream/x/y/dir/x/y/f.ts", swapLinkCredentials(p+"/stream/a/b/dir/a/b/f.ts", from, to), "credential segments deeper in the path")
 }
 
 func TestBuildViewPlaylist_SwapsCredentialsInTagsInsideAnEntry(t *testing.T) {
