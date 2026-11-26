@@ -185,16 +185,6 @@ func (o *adminOIDC) verify(signed string) (string, bool) {
 	return string(value), true
 }
 
-func randomString() string {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		// crypto/rand failing means the platform is broken; a login must not
-		// proceed on predictable state.
-		panic(err)
-	}
-	return base64.RawURLEncoding.EncodeToString(b)
-}
-
 func (o *adminOIDC) setCookie(w http.ResponseWriter, r *http.Request, name, value, path string, ttl time.Duration) {
 	http.SetCookie(w, &http.Cookie{
 		Name: name, Value: value, Path: path, MaxAge: int(ttl.Seconds()),
@@ -240,7 +230,7 @@ func (o *adminOIDC) authorize(w http.ResponseWriter, r *http.Request) bool {
 
 func (p *Proxy) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 	o := p.oidc
-	state, nonce, verifier := randomString(), randomString(), oauth2.GenerateVerifier()
+	state, nonce, verifier := randHex(32), randHex(32), oauth2.GenerateVerifier()
 	target, err := o.backend.authURL(r.Context(), state, nonce, verifier)
 	if err != nil {
 		loggerFromContext(r.Context(), p.logger).ErrorContext(r.Context(), "oidc login failed", "error", err)

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sync"
 
 	"github.com/oskarrn93/iptv-proxy/internal/iptvproxy/curation"
@@ -154,28 +155,19 @@ func (s *viewStore) Put(v View) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	next := make([]resolvedView, 0, len(s.views)+1)
-	replaced := false
-	var others []resolvedView
-	for _, e := range s.views {
-		if e.Name == v.Name {
-			continue
-		}
-		others = append(others, e)
+	i := slices.IndexFunc(s.views, func(e resolvedView) bool { return e.Name == v.Name })
+	others := s.views
+	if i >= 0 {
+		others = slices.Delete(slices.Clone(s.views), i, i+1)
 	}
 	rv, err := s.resolve(v, others)
 	if err != nil {
 		return err
 	}
-	for _, e := range s.views {
-		if e.Name == v.Name {
-			next = append(next, rv)
-			replaced = true
-			continue
-		}
-		next = append(next, e)
-	}
-	if !replaced {
+	next := slices.Clone(s.views)
+	if i >= 0 {
+		next[i] = rv
+	} else {
 		next = append(next, rv)
 	}
 	if err := s.persist(next); err != nil {
@@ -212,16 +204,18 @@ func (s *viewStore) Delete(name string) error {
 func (s *viewStore) Match(creds Credentials) (matched, candidate *resolvedView) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// Put and Delete replace s.views rather than edit it, so a pointer into
+	// the current slice stays valid after the lock is released.
 	for i := range s.views {
-		v := s.views[i]
+		v := &s.views[i]
 		userOK, passOK := v.Credentials.matches(creds)
 		if !userOK {
 			continue
 		}
 		if passOK {
-			return &v, nil
+			return v, nil
 		}
-		candidate = &v
+		candidate = v
 	}
 	return nil, candidate
 }

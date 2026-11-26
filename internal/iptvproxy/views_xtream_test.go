@@ -108,3 +108,16 @@ func TestViewXtream_FilterFailureIsNotServedUnfiltered(t *testing.T) {
 	assert.GreaterOrEqual(t, rec.Code, 400)
 	assert.NotContains(t, rec.Body.String(), "Hidden")
 }
+
+func TestViewXtream_CannotBypassTheFilter(t *testing.T) {
+	p := newXtreamViewProxy(t, curation.Rules{Exclude: []curation.Pattern{{Field: curation.FieldGroup, Regex: "^Adult$"}}})
+
+	rec := get(p, "/player_api.php?username=viewer&password=vpw&action=get_vod_streams&action=get_live_streams")
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	rec = get(p, "/panel_api.php?username=viewer&password=vpw&action=get_live_streams")
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+
+	rec = get(p, "/panel_api.php?username=alice&password=secret&action=get_live_streams")
+	assert.Equal(t, http.StatusOK, rec.Code, "feeds keep the alias")
+}

@@ -7,7 +7,6 @@ import (
 	"path"
 	"strings"
 	"sync"
-	"unsafe"
 
 	"github.com/oskarrn93/iptv-proxy/internal/iptvproxy/curation"
 )
@@ -17,19 +16,28 @@ import (
 // the set of channels it must not be able to play.
 type viewPlaylist struct {
 	body string
-	// denied holds streamKey of every channel the playlist lists but the view
-	// does not allow.
-	denied map[string]struct{}
+	// channels maps streamKey of every channel the playlist lists to whether
+	// the view may play it.
+	channels map[string]bool
 }
 
 // streamKey identifies a channel independent of how a client spells its link:
 // rest must already be percent-decoded, and the extension is normalized away,
 // because Xtream clients routinely ask for 1234.m3u8 where the playlist says
-// 1234.ts, and a gate keyed on the exact link would let a denied channel
-// through that way.
-func streamKey(prefix, rest string) string {
-	rest = strings.TrimSuffix(rest, path.Ext(rest))
-	return prefix + "/" + rest
+// 1234.ts. The Xtream live forms of one stream id (/live/u/p/ID.ts,
+// /u/p/ID, /timeshift/u/p/<duration>/<start>/ID.ts) share one key, so a
+// channel can't be reached through a sibling URL shape. isChannel reports
+// whether the link has one of those forms.
+func streamKey(prefix, rest string) (key string, isChannel bool) {
+	segments := strings.Split(rest, "/")
+	last := segments[len(segments)-1]
+	stem := strings.TrimSuffix(last, path.Ext(last))
+	switch {
+	case (prefix == "live" || prefix == bareCredsStreamPrefix) && len(segments) == 1,
+		prefix == "timeshift" && len(segments) == 3:
+		return "live/" + stem, true
+	}
+	return prefix + "/" + strings.TrimSuffix(rest, path.Ext(rest)), false
 }
 
 // linkParts splits a rewritten link line, which always has the shape
@@ -51,9 +59,12 @@ func linkParts(line string) (prefix, rest string, ok bool) {
 }
 
 // swapLinkCredentials rewrites the feed credentials in every rewritten link of
-// line (a bare URI line or a URI="..." attribute) to the view's. Only the
-// credential slots of a placeholder link are touched, never free text.
+// line (a bare URI line or a URI="..." attribute) to the view's. Only
+// placeholder links are touched, never free text. Besides the credential slot
+// after the prefix, the feed's credentials are swapped wherever
+// writeStreamURI put them: whole path segments of the rest and query values.
 func swapLinkCredentials(line string, from, to Credentials) string {
+	swap := credentialSwap{from: from, to: to}
 	var out strings.Builder
 	for {
 		before, after, found := strings.Cut(line, baseURLPlaceholder+"/")
@@ -68,12 +79,24 @@ func swapLinkCredentials(line string, from, to Credentials) string {
 			return out.String()
 		}
 		out.WriteString(prefix + "/")
-		if rest, ok := strings.CutPrefix(tail, from.Username+"/"+from.Password+"/"); ok {
-			out.WriteString(to.Username + "/" + to.Password + "/")
-			line = rest
-		} else {
+		rest, ok := strings.CutPrefix(tail, from.Username+"/"+from.Password+"/")
+		if !ok {
 			line = tail
+			continue
 		}
+		out.WriteString(to.Username + "/" + to.Password + "/")
+
+		end := strings.IndexAny(rest, "\"' \t\x00")
+		if end < 0 {
+			end = len(rest)
+		}
+		linkPath, linkQuery, _ := strings.Cut(rest[:end], "?")
+		linkPath, linkQuery = swap.apply(linkPath, linkQuery)
+		out.WriteString(linkPath)
+		if linkQuery != "" {
+			out.WriteString("?" + linkQuery)
+		}
+		line = rest[end:]
 	}
 }
 
@@ -82,13 +105,19 @@ func swapLinkCredentials(line string, from, to Credentials) string {
 // outside a block (headers, #EXT-X tags) passes through untouched, as RFC 8216
 // requires of line order.
 func buildViewPlaylist(body string, m *curation.Matcher, feed, view Credentials) *viewPlaylist {
-	vp := &viewPlaylist{denied: map[string]struct{}{}}
 	var out strings.Builder
 	out.Grow(len(body))
+	writeLine := func(line string) {
+		out.WriteString(swapLinkCredentials(line, feed, view))
+		out.WriteByte('\n')
+	}
 
+	// allowed per channel key; a key shared by an allowed and a denied entry
+	// (links differing only by query) can't be told apart by path, so allowed
+	// wins.
+	allowed := map[string]bool{}
 	var pending []string
 	var extinf string
-	allowed := map[string]struct{}{}
 
 	for raw := range strings.Lines(body) {
 		line := strings.TrimRight(raw, "\r\n")
@@ -100,41 +129,27 @@ func buildViewPlaylist(body string, m *curation.Matcher, feed, view Credentials)
 		case pending != nil && (trimmed == "" || strings.HasPrefix(trimmed, "#")):
 			pending = append(pending, line)
 		case pending != nil:
-			entry := curation.ParseEntry(extinf, trimmed)
-			prefix, rest, isLink := linkParts(trimmed)
-			ok := m.Allow(entry)
-			if isLink {
+			ok := m.Allow(curation.ParseEntry(extinf, trimmed))
+			if prefix, rest, isLink := linkParts(trimmed); isLink {
 				if unescaped, err := url.PathUnescape(rest); err == nil {
 					rest = unescaped
 				}
-				key := streamKey(prefix, rest)
-				if ok {
-					allowed[key] = struct{}{}
-				} else {
-					vp.denied[key] = struct{}{}
-				}
+				key, _ := streamKey(prefix, rest)
+				allowed[key] = allowed[key] || ok
 			}
 			if ok {
 				for _, p := range pending {
-					out.WriteString(p)
-					out.WriteByte('\n')
+					writeLine(p)
 				}
-				out.WriteString(swapLinkCredentials(line, feed, view))
-				out.WriteByte('\n')
+				writeLine(line)
 			}
 			pending = nil
 		default:
-			out.WriteString(swapLinkCredentials(line, feed, view))
-			out.WriteByte('\n')
+			writeLine(line)
 		}
 	}
-	// A key shared by an allowed and a denied entry (links differing only by
-	// query) can't be told apart by path, so the allowed entry wins.
-	for k := range allowed {
-		delete(vp.denied, k)
-	}
-	vp.body = strings.Clone(out.String())
-	return vp
+
+	return &viewPlaylist{body: strings.Clone(out.String()), channels: allowed}
 }
 
 // viewPlaylists memoizes buildViewPlaylist per view. The cached feed playlist
@@ -143,14 +158,17 @@ func buildViewPlaylist(body string, m *curation.Matcher, feed, view Credentials)
 // nothing.
 type viewPlaylists struct {
 	mu    sync.Mutex
-	items map[string]viewPlaylistEntry
+	items map[string]*viewPlaylistEntry
 }
 
+// viewPlaylistEntry has its own lock so one view's rebuild doesn't stall
+// every other view's requests behind the map lock.
 type viewPlaylistEntry struct {
-	// A new feed playlist or edited rules change these, which is what
-	// invalidates the entry; identity is enough because both are immutable.
-	body    *byte
-	bodyLen int
+	mu sync.Mutex
+	// A new feed playlist, edited rules or new credentials invalidate the
+	// entry. Comparing body costs a pointer check while the feed cache still
+	// serves the same string.
+	body    string
 	matcher *curation.Matcher
 	creds   Credentials
 	value   *viewPlaylist
@@ -158,17 +176,23 @@ type viewPlaylistEntry struct {
 
 func (c *viewPlaylists) get(v *resolvedView, feed *feedService, body string) *viewPlaylist {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.items == nil {
-		c.items = map[string]viewPlaylistEntry{}
+		c.items = map[string]*viewPlaylistEntry{}
 	}
-	e, ok := c.items[v.Name]
-	if ok && e.body == unsafe.StringData(body) && e.bodyLen == len(body) && e.matcher == v.Matcher && e.creds == v.Credentials {
-		return e.value
+	e := c.items[v.Name]
+	if e == nil {
+		e = &viewPlaylistEntry{}
+		c.items[v.Name] = e
 	}
-	value := buildViewPlaylist(body, v.Matcher, feed.creds, v.Credentials)
-	c.items[v.Name] = viewPlaylistEntry{unsafe.StringData(body), len(body), v.Matcher, v.Credentials, value}
-	return value
+	c.mu.Unlock()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.value == nil || e.matcher != v.Matcher || e.creds != v.Credentials || e.body != body {
+		e.value = buildViewPlaylist(body, v.Matcher, feed.creds, v.Credentials)
+		e.body, e.matcher, e.creds = body, v.Matcher, v.Credentials
+	}
+	return e.value
 }
 
 // serveViewPlaylist serves the view's filtered copy of the feed's cached
@@ -184,10 +208,10 @@ func (p *Proxy) serveViewPlaylist(ctx context.Context, w http.ResponseWriter, he
 }
 
 // viewMayStream reports whether the view may play the stream link r asks for.
-// A channel the feed's playlist lists but the view's rules exclude is refused,
-// so guessing or remembering an unlisted channel's URL gets a view nowhere.
-// Links the playlist doesn't list as channels (HLS segments, sub-playlists)
-// pass: they belong to a channel the view already reached.
+// A live channel the view's rules exclude, or the playlist doesn't list, is
+// refused, so guessing or remembering its URL gets a view nowhere. Links that
+// aren't live channel forms (HLS segments, sub-playlists) pass: they belong to
+// a channel the view already reached.
 func (p *Proxy) viewMayStream(r *http.Request, f *feedService, v *resolvedView, prefix string) bool {
 	result, err := f.getPlaylist(r.Context(), r.Header)
 	if err != nil {
@@ -196,6 +220,11 @@ func (p *Proxy) viewMayStream(r *http.Request, f *feedService, v *resolvedView, 
 		return false
 	}
 	vp := p.viewPlaylists.get(v, f, result.body)
-	_, denied := vp.denied[streamKey(prefix, r.PathValue("rest"))]
-	return !denied
+	key, isChannel := streamKey(prefix, r.PathValue("rest"))
+	if allowed, listed := vp.channels[key]; listed {
+		return allowed
+	}
+	// A live channel the playlist doesn't list (say, one the feed's
+	// exclude_group_prefixes dropped) isn't one the view's rules ever allowed.
+	return !isChannel
 }

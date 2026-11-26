@@ -30,6 +30,12 @@ func (s *feedService) forView(c Credentials) *feedService {
 // (VOD, series, EPG lookups, login) passes through unfiltered, with the view's
 // own credentials in place of the upstream's.
 func (p *Proxy) serveViewXtreamAPI(ctx context.Context, w http.ResponseWriter, header http.Header, rawQuery, baseURL string, f *feedService, v *resolvedView) {
+	// The proxy and the upstream must agree on which action runs: a repeated
+	// parameter could show the filter one and the upstream another.
+	if query, _ := url.ParseQuery(rawQuery); len(query["action"]) > 1 {
+		http.Error(w, "repeated action parameter", http.StatusBadRequest)
+		return
+	}
 	vs := f.forView(v.Credentials)
 	vs.serveXtreamAPI(ctx, w, header, rawQuery, baseURL, vs.liveFilter(ctx, header, rawQuery, v.Matcher))
 }

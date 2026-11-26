@@ -39,12 +39,19 @@ var (
 	tvgIDPattern      = attrPattern("tvg-id")
 )
 
+// DisplayName returns the channel name from a #EXTINF line: the text after its
+// last comma, per the M3U EXTINF format (duration,title — any tvg-* attributes
+// precede the comma, never follow it).
+func DisplayName(extinf string) string {
+	if idx := strings.LastIndex(extinf, ","); idx != -1 && idx+1 < len(extinf) {
+		return strings.TrimSpace(extinf[idx+1:])
+	}
+	return extinf
+}
+
 // ParseEntry builds an Entry from a #EXTINF line and the URI line after it.
 func ParseEntry(extinf, uri string) Entry {
-	e := Entry{Name: extinf}
-	if idx := strings.LastIndex(extinf, ","); idx != -1 && idx+1 < len(extinf) {
-		e.Name = strings.TrimSpace(extinf[idx+1:])
-	}
+	e := Entry{Name: DisplayName(extinf)}
 	if m := groupTitlePattern.FindStringSubmatch(extinf); m != nil {
 		e.Group = m[1]
 	}
