@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>iptv-proxy views</title>
+    <script src="/admin/static/htmx.js"></script>
+    <link rel="stylesheet" href="/admin/static/admin.css" />
+  </head>
+  <body>
+    <p><a href="/admin">&larr; shares</a></p>
+    <h1>Views</h1>
+    <p>
+      A view is a separate login that sees only the channels of one feed its
+      rules allow. Rules are re-applied whenever the feed's playlist refreshes.
+    </p>
+
+    <table>
+      <thead>
+        <tr><th>name</th><th>feed</th><th>username</th><th>rules</th><th></th></tr>
+      </thead>
+      <tbody
+        id="views"
+        hx-get="/admin/views/list"
+        hx-trigger="load, views-changed from:body"
+        hx-swap="innerHTML"
+      ></tbody>
+    </table>
+    <button hx-get="/admin/views/editor" hx-target="#editor" hx-swap="innerHTML">New view</button>
+    <div id="status" role="status"></div>
+
+    <div id="editor"></div>
+
+    <script>
+      document.body.addEventListener("htmx:responseError", function (e) {
+        document.getElementById("status").textContent = e.detail.xhr.responseText;
+      });
+    </script>
+  </body>
+</html>

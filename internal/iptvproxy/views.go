@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 
 	"github.com/oskarrn93/iptv-proxy/internal/iptvproxy/curation"
@@ -26,6 +27,10 @@ type resolvedView struct {
 	View
 	Matcher *curation.Matcher
 }
+
+// viewNamePattern keeps names usable as a URL path segment, which the admin
+// routes address views by.
+var viewNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 
 var (
 	errViewNotFound = errors.New("view not found")
@@ -91,8 +96,8 @@ func (s *viewStore) resolve(v View, others []resolvedView) (resolvedView, error)
 	invalid := func(format string, args ...any) (resolvedView, error) {
 		return resolvedView{}, fmt.Errorf("%w: %s", errViewInvalid, fmt.Sprintf(format, args...))
 	}
-	if v.Name == "" {
-		return invalid("name is required")
+	if !viewNamePattern.MatchString(v.Name) {
+		return invalid("name must be 1-64 characters of letters, digits, '_', '.' or '-'")
 	}
 	if v.Username == "" || v.Password == "" {
 		return invalid("username and password are required")
