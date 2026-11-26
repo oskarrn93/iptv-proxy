@@ -42,33 +42,38 @@ func TestNewProxy_InvalidUpstreamURL(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func authFeed(p *Proxy, w http.ResponseWriter, r *http.Request) *feedService {
+	f, _ := p.authenticate(w, r)
+	return f
+}
+
 func TestAuthenticate(t *testing.T) {
 	p := newTestProxy(t, "http://upstream.example.com/get.php")
 
 	t.Run("valid query params", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/playlist.m3u8?username=alice&password=secret", nil)
 		rec := httptest.NewRecorder()
-		assert.NotNil(t, p.authenticate(rec, req))
+		assert.NotNil(t, authFeed(p, rec, req))
 	})
 
 	t.Run("valid basic auth", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/playlist.m3u8", nil)
 		req.SetBasicAuth("alice", "secret")
 		rec := httptest.NewRecorder()
-		assert.NotNil(t, p.authenticate(rec, req))
+		assert.NotNil(t, authFeed(p, rec, req))
 	})
 
 	t.Run("wrong password", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/playlist.m3u8?username=alice&password=wrong", nil)
 		rec := httptest.NewRecorder()
-		assert.Nil(t, p.authenticate(rec, req))
+		assert.Nil(t, authFeed(p, rec, req))
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	})
 
 	t.Run("no credentials", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/playlist.m3u8", nil)
 		rec := httptest.NewRecorder()
-		assert.Nil(t, p.authenticate(rec, req))
+		assert.Nil(t, authFeed(p, rec, req))
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	})
 }
@@ -81,7 +86,7 @@ func TestAuthenticate_MultipleFeeds(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/playlist.m3u8?username=bob&password=secret2", nil)
 	rec := httptest.NewRecorder()
-	f := p.authenticate(rec, req)
+	f := authFeed(p, rec, req)
 	require.NotNil(t, f)
 	assert.Equal(t, "feed-2", f.name)
 }
